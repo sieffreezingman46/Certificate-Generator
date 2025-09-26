@@ -95,7 +95,7 @@ for index, row in names.iterrows():
     # Create overlay with name
     packet = io.BytesIO()
     can = canvas.Canvas(packet, pagesize=letter)
-    can.setFont("MyFont", 30)
+    can.setFont("MyFont", 25)
 
     # Position (x, y) → adjust for your certificate layout
     can.drawCentredString(420, 300, name)
