@@ -92,23 +92,26 @@ pdfmetrics.registerFont(TTFont("MyFont", "Montserrat-Medium.ttf"))
 for index, row in names.iterrows():
     name = str(row['Name']).strip()  # use column "Name"
 
-    # Create overlay with name
+    # Read template first to match overlay page size
+    template = PdfReader(open(template_pdf, "rb"))
+    page = template.pages[0]
+    page_width = float(page.mediabox.width)
+    page_height = float(page.mediabox.height)
+
+    # Create overlay with name using template page size
     packet = io.BytesIO()
-    can = canvas.Canvas(packet, pagesize=letter)
-    can.setFont("MyFont", 25)
+    can = canvas.Canvas(packet, pagesize=(page_width, page_height))
+    can.setFont("MyFont", 30)
 
     # Position (x, y) → adjust for your certificate layout
-    can.drawCentredString(420, 300, name)
+    can.drawCentredString(page_width / 2, 300, name)
 
     can.save()
     packet.seek(0)
 
     # Merge overlay with certificate
     overlay_pdf = PdfReader(packet)
-    template = PdfReader(open(template_pdf, "rb"))
     writer = PdfWriter()
-
-    page = template.pages[0]
     page.merge_page(overlay_pdf.pages[0])
     writer.add_page(page)
 
