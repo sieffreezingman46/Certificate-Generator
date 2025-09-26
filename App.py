@@ -91,6 +91,8 @@ pdfmetrics.registerFont(TTFont("MyFont", "Montserrat-Medium.ttf"))
 # --- Generate certificates ---
 for index, row in names.iterrows():
     name = str(row['Name']).strip()  # use column "Name"
+    if name and name[0].islower():
+        name = name[0].upper() + name[1:]
 
     # Read template first to match overlay page size
     template = PdfReader(open(template_pdf, "rb"))
