@@ -8,6 +8,30 @@ from pathlib import Path
 
 # --- Ensure required packages are installed before importing them ---
 
+def print_start_banner():
+    try:
+        print("""
+ ██████╗███████╗██████╗ ████████╗██╗███████╗██╗ ██████╗ █████╗ ████████╗███████╗
+██╔════╝██╔════╝██╔══██╗╚══██╔══╝██║██╔════╝██║██╔════╝██╔══██╗╚══██╔══╝██╔════╝
+██║     █████╗  ██████╔╝   ██║   ██║█████╗  ██║██║     ███████║   ██║   █████╗  
+██║     ██╔══╝  ██╔══██╗   ██║   ██║██╔══╝  ██║██║     ██╔══██║   ██║   ██╔══╝  
+╚██████╗███████╗██║  ██║   ██║   ██║██║     ██║╚██████╗██║  ██║   ██║   ███████╗
+ ╚═════╝╚══════╝╚═╝  ╚═╝   ╚═╝   ╚═╝╚═╝     ╚═╝ ╚═════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝
+                                                                                
+ ██████╗ ███████╗███╗   ██╗███████╗██████╗  █████╗ ████████╗ ██████╗ ██████╗    
+██╔════╝ ██╔════╝████╗  ██║██╔════╝██╔══██╗██╔══██╗╚══██╔══╝██╔═══██╗██╔══██╗   
+██║  ███╗█████╗  ██╔██╗ ██║█████╗  ██████╔╝███████║   ██║   ██║   ██║██████╔╝   
+██║   ██║██╔══╝  ██║╚██╗██║██╔══╝  ██╔══██╗██╔══██║   ██║   ██║   ██║██╔══██╗   
+╚██████╔╝███████╗██║ ╚████║███████╗██║  ██║██║  ██║   ██║   ╚██████╔╝██║  ██║   
+ ╚═════╝ ╚══════╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝   
+
+Automated Certificate Generator v2.0
+Smart PDF name placement with customizable UI
+
+""")
+    except Exception:
+        pass
+
 def pre_start_update_check():
     """Print-only update check that runs before package checks.
     Uses git to compare local and remote; does not modify files or restart.
@@ -100,6 +124,7 @@ REQUIRED_PACKAGES = [
     ("PySide6", "PySide6"),
 ]
 
+print_start_banner()
 pre_start_update_check()
 print("Checking required packages...")
 for import_name, pip_name in REQUIRED_PACKAGES:
