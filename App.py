@@ -4,6 +4,7 @@ import importlib
 import io
 import os
 from pathlib import Path
+import time
  
 
 # --- Ensure required packages are installed before importing them ---
@@ -29,6 +30,19 @@ Automated Certificate Generator v2.0
 Smart PDF name placement with customizable UI
 
 """)
+    except Exception:
+        pass
+
+
+def _print_exit_and_wait():
+    try:
+        print("Exiting....")
+        try:
+            import sys as _sys
+            _sys.stdout.flush()
+        except Exception:
+            pass
+        time.sleep(3)
     except Exception:
         pass
 
@@ -1432,7 +1446,7 @@ def main():
     
     # Print on exit
     try:
-        app.aboutToQuit.connect(lambda: print("Exiting...."))
+        app.aboutToQuit.connect(_print_exit_and_wait)
     except Exception:
         pass
     
