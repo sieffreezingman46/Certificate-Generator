@@ -7,6 +7,66 @@ from pathlib import Path
  
 
 # --- Ensure required packages are installed before importing them ---
+
+def pre_start_update_check():
+    """Print-only update check that runs before package checks.
+    Uses git to compare local and remote; does not modify files or restart.
+    """
+    try:
+        print("\n========== update: pre-flight ==========")
+        print("[update] initializing...")
+        repo_dir = Path(__file__).resolve().parent
+        if not (repo_dir / ".git").exists():
+            print("[update] repo: not a git repository -> skip")
+            print("========== update: done =========\n")
+            return
+
+        def run_git(*args):
+            return subprocess.run(["git", *args], cwd=str(repo_dir), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+        # Fetch quietly
+        print("[update] fetching: remote refs ...")
+        run_git("fetch", "--all", "--prune", "--quiet")
+        print("[update] fetching: ok")
+
+        # Current branch
+        res_branch = run_git("rev-parse", "--abbrev-ref", "HEAD")
+        branch = (res_branch.stdout or "").strip()
+        if res_branch.returncode != 0 or branch == "HEAD":
+            print("[update] branch: detached or unknown -> skip")
+            print("========== update: done =========\n")
+            return
+
+        res_upstream = run_git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+        if res_upstream.returncode == 0:
+            upstream_ref = res_upstream.stdout.strip()
+        else:
+            upstream_ref = f"origin/{branch}"
+        print(f"[update] upstream: {upstream_ref}")
+
+        res_local = run_git("rev-parse", "HEAD")
+        res_remote = run_git("rev-parse", upstream_ref)
+        if res_local.returncode != 0 or res_remote.returncode != 0:
+            print("[update] compare: failed -> skip")
+            print("========== update: done =========\n")
+            return
+
+        local_sha = (res_local.stdout or "").strip()
+        remote_sha = (res_remote.stdout or "").strip()
+        if not local_sha or not remote_sha or local_sha == remote_sha:
+            print("[update] status: up-to-date ✓")
+            print("========== update: done =========\n")
+            return
+
+        print(f"[update] status: behind  {local_sha[:7]} -> {remote_sha[:7]}")
+        print("[update] action: will apply after UI loads")
+        print("========== update: done =========\n")
+    except Exception:
+        print("[update] error: pre-flight check skipped")
+        try:
+            print("========== update: done =========\n")
+        except Exception:
+            pass
 def _get_package_version(module):
     return getattr(module, "__version__", getattr(module, "Version", "?"))
 
@@ -40,6 +100,7 @@ REQUIRED_PACKAGES = [
     ("PySide6", "PySide6"),
 ]
 
+pre_start_update_check()
 print("Checking required packages...")
 for import_name, pip_name in REQUIRED_PACKAGES:
     ensure_package(import_name, pip_name)
@@ -1341,6 +1402,12 @@ def main():
     # Check for updates shortly after the UI shows, so prompts have a parent
     try:
         QTimer.singleShot(200, lambda: check_for_updates_on_startup(window))
+    except Exception:
+        pass
+    
+    # Print on exit
+    try:
+        app.aboutToQuit.connect(lambda: print("Exiting...."))
     except Exception:
         pass
     
