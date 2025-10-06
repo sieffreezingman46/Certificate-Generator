@@ -42,7 +42,7 @@ def _print_exit_and_wait():
             _sys.stdout.flush()
         except Exception:
             pass
-        time.sleep(3)
+        time.sleep(2)
     except Exception:
         pass
 
@@ -505,16 +505,26 @@ class CertificateGeneratorThread(QThread):
             if self.name_column not in names_df.columns:
                 raise KeyError(f"Column '{self.name_column}' not found in sheet")
 
+            # Build ordered names list from selected column until the first blank cell
+            names_series = names_df[self.name_column]
+            names_list = []
+            for cell in names_series:
+                if pd.isna(cell) or (isinstance(cell, str) and cell.strip() == ""):
+                    break  # stop at first blank cell
+                names_list.append(str(cell).strip())
+            if not names_list:
+                raise ValueError(f"No names found in column '{self.name_column}'")
+
             # Register font
             if not self.font_path or not os.path.exists(self.font_path):
-                raise FileNotFoundError("Font .ttf file not found")
-            pdfmetrics.registerFont(TTFont("MyFont", self.font_path))
+                raise FileNotFoundError("Font file not found")
+            font_name = os.path.splitext(os.path.basename(self.font_path))[0].replace(" ", "_")
+            pdfmetrics.registerFont(TTFont(font_name, self.font_path))
 
-            total = len(names_df.index)
+            total = len(names_list)
             completed = 0
 
-            for _, row in names_df.iterrows():
-                raw_name = str(row[self.name_column]).strip()
+            for raw_name in names_list:
                 name_value = capitalize_each_word_preserving_rest(raw_name)
 
                 # Fresh template per certificate to avoid cumulative merges
@@ -526,7 +536,7 @@ class CertificateGeneratorThread(QThread):
                 # Create overlay
                 packet = io.BytesIO()
                 can = canvas.Canvas(packet, pagesize=(page_width, page_height))
-                can.setFont("MyFont", int(self.font_size))
+                can.setFont(font_name, int(self.font_size))
                 can.drawCentredString(page_width / 2, int(self.y_position), name_value)
                 can.save()
                 packet.seek(0)
@@ -680,6 +690,14 @@ class CertificateGeneratorApp(QMainWindow):
         self._panning = False
         self._pan_start = None
         self._fit_on_next_load = False
+        self._show_required_feedback = False
+        # Multi-preview state
+        self.preview_names = []
+        self.preview_index = 0
+        self._base_pixmap = None
+        self._last_preview_key = None
+        self._pdf_page_width_pts = None
+        self._pdf_page_height_pts = None
         
         self.setup_ui()
         self.apply_styles()
@@ -708,42 +726,63 @@ class CertificateGeneratorApp(QMainWindow):
         inputs_layout = QGridLayout(inputs_group)
         
         # Names file
-        inputs_layout.addWidget(QLabel("Names file:"), 0, 0)
+        inputs_layout.addWidget(QLabel("Excel file:"), 0, 0)
         self.names_edit = QLineEdit()
         self.names_edit.setPlaceholderText("Select Excel or CSV file...")
+        self.names_edit.textChanged.connect(self.on_names_text_changed)
         inputs_layout.addWidget(self.names_edit, 0, 1)
         self.names_btn = QPushButton("Browse")
         self.names_btn.clicked.connect(self.browse_names)
         inputs_layout.addWidget(self.names_btn, 0, 2)
+        self.names_required_lbl = QLabel("*Required")
+        self.names_required_lbl.setStyleSheet("color: #ff4d4d; font-size: 11px; font-family: 'Segoe UI', 'Inter', 'Noto Sans', Arial, sans-serif;")
+        self.names_required_lbl.setVisible(False)
+        inputs_layout.addWidget(self.names_required_lbl, 0, 3)
         
         # Template PDF
         inputs_layout.addWidget(QLabel("Template PDF:"), 1, 0)
         self.template_edit = QLineEdit()
         self.template_edit.setPlaceholderText("Select PDF template...")
+        self.template_edit.textChanged.connect(self.on_template_text_changed)
         inputs_layout.addWidget(self.template_edit, 1, 1)
         self.template_btn = QPushButton("Browse")
         self.template_btn.clicked.connect(self.browse_template)
         inputs_layout.addWidget(self.template_btn, 1, 2)
+        self.template_required_lbl = QLabel("*Required")
+        self.template_required_lbl.setStyleSheet("color: #ff4d4d; font-size: 11px; font-family: 'Segoe UI', 'Inter', 'Noto Sans', Arial, sans-serif;")
+        self.template_required_lbl.setVisible(False)
+        inputs_layout.addWidget(self.template_required_lbl, 1, 3)
         
         # Output folder
         inputs_layout.addWidget(QLabel("Output folder:"), 2, 0)
         self.output_edit = QLineEdit()
         self.output_edit.setPlaceholderText("Select output folder...")
+        self.output_edit.textChanged.connect(self.on_output_text_changed)
         inputs_layout.addWidget(self.output_edit, 2, 1)
         self.output_btn = QPushButton("Browse")
         self.output_btn.clicked.connect(self.browse_output)
         inputs_layout.addWidget(self.output_btn, 2, 2)
+        self.output_required_lbl = QLabel("*Required")
+        self.output_required_lbl.setStyleSheet("color: #ff4d4d; font-size: 11px; font-family: 'Segoe UI', 'Inter', 'Noto Sans', Arial, sans-serif;")
+        self.output_required_lbl.setVisible(False)
+        inputs_layout.addWidget(self.output_required_lbl, 2, 3)
         
         # Font file
         inputs_layout.addWidget(QLabel("Font file:"), 3, 0)
         self.font_edit = QLineEdit()
-        self.font_edit.setPlaceholderText("Select TTF font file...")
+        self.font_edit.setPlaceholderText("Select font file (.ttf/.otf)...")
+        self.font_edit.textChanged.connect(self.on_font_text_changed)
         inputs_layout.addWidget(self.font_edit, 3, 1)
         self.font_btn = QPushButton("Browse")
         self.font_btn.clicked.connect(self.browse_font)
         inputs_layout.addWidget(self.font_btn, 3, 2)
+        self.font_required_lbl = QLabel("*Required")
+        self.font_required_lbl.setStyleSheet("color: #ff4d4d; font-size: 11px; font-family: 'Segoe UI', 'Inter', 'Noto Sans', Arial, sans-serif;")
+        self.font_required_lbl.setVisible(False)
+        inputs_layout.addWidget(self.font_required_lbl, 3, 3)
         
         inputs_layout.setColumnStretch(1, 1)
+        inputs_layout.setColumnStretch(3, 0)
         left_layout.addWidget(inputs_group)
         
         # Options Group
@@ -771,7 +810,8 @@ class CertificateGeneratorApp(QMainWindow):
         # Name column
         options_layout.addWidget(QLabel("Name column:"), 2, 0)
         self.name_col_edit = QLineEdit("Name")
-        self.name_col_edit.textChanged.connect(lambda t: setattr(self, 'name_column', t))
+        self.name_col_edit.setPlaceholderText("Column header (default: Name)")
+        self.name_col_edit.textChanged.connect(self.on_name_column_changed)
         options_layout.addWidget(self.name_col_edit, 2, 1, 1, 2)
 
         # Removed Preview font tweak (%)
@@ -889,6 +929,27 @@ class CertificateGeneratorApp(QMainWindow):
         self.zoom_overlay.setVisible(False)
         
         right_layout.addWidget(preview_container, 1)
+
+        # Navigation arrows overlay (left/right of preview)
+        self.nav_left_btn = QPushButton("<", self.preview_scroll.viewport())
+        self.nav_left_btn.setObjectName("nav_left_btn")
+        self.nav_left_btn.setFixedSize(36, 36)
+        self.nav_left_btn.clicked.connect(self.on_prev_preview)
+        self.nav_left_btn.setVisible(False)
+
+        self.nav_right_btn = QPushButton(">", self.preview_scroll.viewport())
+        self.nav_right_btn.setObjectName("nav_right_btn")
+        self.nav_right_btn.setFixedSize(36, 36)
+        self.nav_right_btn.clicked.connect(self.on_next_preview)
+        self.nav_right_btn.setVisible(False)
+        # Ensure a modern, clean font
+        try:
+            nav_font = QFont("Segoe UI", 12)
+            nav_font.setWeight(QFont.DemiBold)
+            self.nav_left_btn.setFont(nav_font)
+            self.nav_right_btn.setFont(nav_font)
+        except Exception:
+            pass
         
         # Add panels to main layout
         main_layout.addWidget(left_panel)
@@ -943,6 +1004,14 @@ class CertificateGeneratorApp(QMainWindow):
             QLineEdit:focus {
                 border-color: #8e44ad;
                 outline: none;
+            }
+
+            /* Required state styling */
+            QLineEdit[required="true"] {
+                border-color: #ff4d4d;
+            }
+            QLineEdit[required="true"]:hover {
+                border-color: #ffb3b3;
             }
             
             QPushButton {
@@ -1016,6 +1085,30 @@ class CertificateGeneratorApp(QMainWindow):
                 color: #888888;
             }
             
+            QPushButton#nav_left_btn, QPushButton#nav_right_btn {
+                background-color: #2d2d2d;
+                color: #d0d0d0;
+                border: 1px solid #404040;
+                border-radius: 18px; /* half of 36px */
+                font-size: 18px;
+                font-weight: 600;
+                font-family: "Segoe UI", "Inter", "Noto Sans", "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+                padding: 0px;
+                min-width: 0px;
+            }
+
+            QPushButton#nav_left_btn:hover, QPushButton#nav_right_btn:hover {
+                background-color: #3a3a3a;
+                color: #ffffff;
+                border-color: #555555;
+            }
+
+            QPushButton#nav_left_btn:disabled, QPushButton#nav_right_btn:disabled {
+                background-color: #262626;
+                color: #777777;
+                border-color: #333333;
+            }
+
             
             QProgressBar {
                 border: 2px solid #404040;
@@ -1095,23 +1188,28 @@ class CertificateGeneratorApp(QMainWindow):
         self.zoom_out_btn.setObjectName("zoom_out_btn")
 
     def setup_defaults(self):
-        # Set default font path if exists
-        default_font_path = os.path.join(os.getcwd(), "Montserrat-Medium.ttf")
-        if os.path.exists(default_font_path):
-            self.font_edit.setText(default_font_path)
-            self.font_path = default_font_path
+        # No default font; user should choose a font file
+        pass
 
     def browse_names(self):
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Names File", "", 
+            self, "Select Excel or CSV File", "", 
             "Excel files (*.xlsx);;CSV files (*.csv);;All files (*)"
         )
         if file_path:
             self.names_edit.setText(file_path)
             self.names_file_path = file_path
+            # Rebuild preview names list
+            self._build_preview_names()
+            self.preview_index = 0
             # Refresh preview if template is already loaded
             if self.template_pdf_path:
-                self.load_preview()
+                if self._base_pixmap is None:
+                    self.load_preview()
+                else:
+                    self.refresh_preview_overlay()
+            self.update_nav_buttons()
+        self._update_required_feedback()
 
     def browse_template(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -1123,26 +1221,31 @@ class CertificateGeneratorApp(QMainWindow):
             self.template_pdf_path = file_path
             # Load preview
             self._fit_on_next_load = True
+            # Ensure names list is prepared if names file already chosen
+            self._build_preview_names()
             self.load_preview()
             # Show zoom controls now that a template is selected and position them
             try:
                 self.zoom_overlay.setVisible(True)
                 QTimer.singleShot(0, self.position_zoom_overlay)
+                QTimer.singleShot(0, self.position_nav_buttons)
             except Exception:
                 pass
             # Auto-open Y position selector
             self.reconfigure_y()
+        self._update_required_feedback()
 
     def browse_output(self):
         folder_path = QFileDialog.getExistingDirectory(self, "Select Output Folder")
         if folder_path:
             self.output_edit.setText(folder_path)
             self.output_folder_path = folder_path
+        self._update_required_feedback()
 
     def browse_font(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Font File", "", 
-            "TrueType fonts (*.ttf);;All files (*)"
+            "Font files (*.ttf *.otf);;All files (*)"
         )
         if file_path:
             self.font_edit.setText(file_path)
@@ -1150,6 +1253,7 @@ class CertificateGeneratorApp(QMainWindow):
             # Refresh preview if template is already loaded
             if self.template_pdf_path:
                 self.load_preview()
+        self._update_required_feedback()
 
     def on_font_size_changed(self, value):
         self.font_size = value
@@ -1164,9 +1268,14 @@ class CertificateGeneratorApp(QMainWindow):
             if 8 <= value <= 200:  # Valid range
                 self.font_size = value
                 if self.template_pdf_path:
-                    self.load_preview()
+                    # Only overlay changes; reuse base pixmap for snappy updates
+                    if self._base_pixmap is not None:
+                        self.refresh_preview_overlay()
+                    else:
+                        self.load_preview()
         except ValueError:
             pass  # Ignore invalid input while typing
+        self._update_required_feedback()
 
     def on_y_position_changed(self, value):
         self.y_position = value
@@ -1181,9 +1290,14 @@ class CertificateGeneratorApp(QMainWindow):
             if 0 <= value <= 2000:  # Valid range
                 self.y_position = value
                 if self.template_pdf_path:
-                    self.load_preview()
+                    # Only overlay changes; reuse base pixmap for snappy updates
+                    if self._base_pixmap is not None:
+                        self.refresh_preview_overlay()
+                    else:
+                        self.load_preview()
         except ValueError:
             pass  # Ignore invalid input while typing
+        self._update_required_feedback()
 
     # Removed on_preview_tweak_changed as preview tweak control was removed
     # def on_preview_tweak_changed(self, value):
@@ -1198,6 +1312,7 @@ class CertificateGeneratorApp(QMainWindow):
         # Position zoom overlay at bottom-left after preview loads
         if self.zoom_overlay and self.preview_scroll:
             QTimer.singleShot(100, self.position_zoom_overlay)
+            QTimer.singleShot(100, self.position_nav_buttons)
             
         try:
             doc = fitz.open(self.template_pdf_path)
@@ -1230,55 +1345,13 @@ class CertificateGeneratorApp(QMainWindow):
             
             pixmap = QPixmap()
             pixmap.loadFromData(img_bytes.getvalue())
-            
-            # Add first name preview if names file and font file are selected
-            if self.names_file_path and os.path.exists(self.names_file_path) and self.font_path and os.path.exists(self.font_path):
-                try:
-                    if self.names_file_path.endswith(".xlsx"):
-                        names_df = pd.read_excel(self.names_file_path)
-                    else:
-                        names_df = pd.read_csv(self.names_file_path)
-                    
-                    if self.name_column in names_df.columns and len(names_df) > 0:
-                        first_name = str(names_df.iloc[0][self.name_column]).strip()
-                        first_name = capitalize_each_word_preserving_rest(first_name)
-                        # Convert to QPixmap respecting template DPI
-                        # Use the actual font TTF chosen by the user
-                        temp_font_id = QFontDatabase.addApplicationFont(self.font_path)
-                        font_family = "Arial"
-                        if temp_font_id != -1:
-                            families = QFontDatabase.applicationFontFamilies(temp_font_id)
-                            if families:
-                                font_family = families[0]
+            # Store base pixmap and page size for fast overlay redraws
+            self._base_pixmap = pixmap
+            self._pdf_page_width_pts = float(page.rect.width)
+            self._pdf_page_height_pts = float(page.rect.height)
 
-                        painter = QPainter(pixmap)
-                        # Determine scale between PDF points and preview pixels
-                        pdf_width_pts = float(page.rect.width)
-                        pdf_height_pts = float(page.rect.height)
-                        scale_x = pixmap.width() / pdf_width_pts
-                        scale_y = pixmap.height() / pdf_height_pts
-
-                        # Map PDF point size to pixels using page scale; keep independent of zoom artifacts
-                        preview_font_px = max(int(self.font_size * scale_y), 1)
-                        font = QFont(font_family)
-                        font.setPixelSize(preview_font_px)
-                        painter.setFont(font)
-                        painter.setPen(QPen(Qt.black, 2))
-
-                        # Centered X at half width; Y from bottom to top mapping using scale
-                        center_x = pixmap.width() // 2
-                        preview_y = pixmap.height() - int(self.y_position * scale_y)
-
-                        # Draw centered text
-                        text_rect = painter.fontMetrics().boundingRect(first_name)
-                        painter.drawText(center_x - text_rect.width() // 2, preview_y, first_name)
-                        painter.end()
-                except:
-                    pass  # Ignore errors in preview name rendering
-            
-            # Do not auto-scale; let zoom/scroll area control size
-            self.preview_widget.setPixmap(pixmap)
-            self.preview_widget.resize(pixmap.size())
+            # Draw current overlay and display
+            self.refresh_preview_overlay()
             self.preview_widget.setStyleSheet("")  # Remove placeholder styling
             
         except Exception as e:
@@ -1306,6 +1379,8 @@ class CertificateGeneratorApp(QMainWindow):
                    self.output_folder_path, self.font_path]):
             QMessageBox.warning(self, "Missing Information", 
                               "Please fill in all required fields.")
+            self._show_required_feedback = True
+            self._update_required_feedback()
             return
         
         # Disable generate button and show progress
@@ -1339,19 +1414,66 @@ class CertificateGeneratorApp(QMainWindow):
         self.generate_btn.setEnabled(True)
         QMessageBox.critical(self, "Error", error_message)
 
+    def _update_required_feedback(self):
+        """Show or hide *Required labels and red borders for empty required fields."""
+        if not getattr(self, "_show_required_feedback", False):
+            # Ensure cleared when not in required-feedback mode
+            self._set_required_state(self.names_edit, self.names_required_lbl, False)
+            self._set_required_state(self.template_edit, self.template_required_lbl, False)
+            self._set_required_state(self.output_edit, self.output_required_lbl, False)
+            self._set_required_state(self.font_edit, self.font_required_lbl, False)
+            return
+        self._set_required_state(self.names_edit, self.names_required_lbl, not bool(self.names_edit.text().strip()))
+        self._set_required_state(self.template_edit, self.template_required_lbl, not bool(self.template_edit.text().strip()))
+        self._set_required_state(self.output_edit, self.output_required_lbl, not bool(self.output_edit.text().strip()))
+        self._set_required_state(self.font_edit, self.font_required_lbl, not bool(self.font_edit.text().strip()))
+
+    def _set_required_state(self, line_edit, label, is_required):
+        try:
+            line_edit.setProperty("required", True if is_required else False)
+            line_edit.style().unpolish(line_edit)
+            line_edit.style().polish(line_edit)
+            label.setVisible(bool(is_required))
+        except Exception:
+            pass
+
+    # Live clearing of required state on user input
+    def on_names_text_changed(self, text):
+        if text.strip():
+            self._set_required_state(self.names_edit, self.names_required_lbl, False)
+        self._update_required_feedback()
+
+    def on_template_text_changed(self, text):
+        if text.strip():
+            self._set_required_state(self.template_edit, self.template_required_lbl, False)
+        self._update_required_feedback()
+
+    def on_output_text_changed(self, text):
+        if text.strip():
+            self._set_required_state(self.output_edit, self.output_required_lbl, False)
+        self._update_required_feedback()
+
+    def on_font_text_changed(self, text):
+        if text.strip():
+            self._set_required_state(self.font_edit, self.font_required_lbl, False)
+        self._update_required_feedback()
+
     def on_zoom_in(self):
         self.preview_zoom = min(self.preview_zoom * 1.2, 4.0)
         self.zoom_drag_bar.set_zoom(self.preview_zoom)
         self.load_preview()
+        QTimer.singleShot(0, self.position_nav_buttons)
 
     def on_zoom_out(self):
         self.preview_zoom = max(self.preview_zoom / 1.2, 0.4)
         self.zoom_drag_bar.set_zoom(self.preview_zoom)
         self.load_preview()
+        QTimer.singleShot(0, self.position_nav_buttons)
 
     def on_zoom_changed(self, zoom_value):
         self.preview_zoom = zoom_value
         self.load_preview()
+        QTimer.singleShot(0, self.position_nav_buttons)
 
     def on_preview_wheel(self, event):
         """Handle mouse wheel events for pinch-to-zoom"""
@@ -1408,6 +1530,126 @@ class CertificateGeneratorApp(QMainWindow):
             x = viewport.width() - self.zoom_overlay.width() - 10  # Right margin
             y = viewport.height() - self.zoom_overlay.height() - 10  # Bottom margin
             self.zoom_overlay.move(x, y)
+
+    def position_nav_buttons(self):
+        """Position left/right navigation buttons centered vertically on the preview viewport"""
+        if not self.preview_scroll:
+            return
+        viewport = self.preview_scroll.viewport()
+        center_y = max((viewport.height() // 2) - (self.nav_left_btn.height() // 2), 10)
+        left_x = 10
+        right_x = viewport.width() - self.nav_right_btn.width() - 10
+        try:
+            self.nav_left_btn.move(left_x, center_y)
+            self.nav_right_btn.move(right_x, center_y)
+        except Exception:
+            pass
+
+    def update_nav_buttons(self):
+        """Update visibility and enabled state of navigation buttons based on available names"""
+        count = len(self.preview_names)
+        try:
+            if not self.template_pdf_path or count == 0:
+                self.nav_left_btn.setVisible(False)
+                self.nav_right_btn.setVisible(False)
+                return
+            if count == 1:
+                # Only one certificate → no navigation
+                self.nav_left_btn.setVisible(False)
+                self.nav_right_btn.setVisible(False)
+                return
+            # Multiple certificates → show based on index
+            show_left = self.preview_index > 0
+            show_right = self.preview_index < (count - 1)
+            self.nav_left_btn.setVisible(show_left)
+            self.nav_right_btn.setVisible(show_right)
+            # Enable states mirror visibility (not strictly necessary but consistent)
+            self.nav_left_btn.setEnabled(show_left)
+            self.nav_right_btn.setEnabled(show_right)
+            self.position_nav_buttons()
+        except Exception:
+            pass
+
+    def on_prev_preview(self):
+        if self.preview_index > 0:
+            self.preview_index -= 1
+            self.update_nav_buttons()
+            self.refresh_preview_overlay()
+
+    def on_next_preview(self):
+        if self.preview_index < len(self.preview_names) - 1:
+            self.preview_index += 1
+            self.update_nav_buttons()
+            self.refresh_preview_overlay()
+
+    def on_name_column_changed(self, text):
+        self.name_column = text or "Name"
+        self._build_preview_names()
+        self.preview_index = 0
+        self.update_nav_buttons()
+        if self.template_pdf_path:
+            if self._base_pixmap is not None:
+                self.refresh_preview_overlay()
+            else:
+                self.load_preview()
+
+    def _build_preview_names(self):
+        """Build the in-memory list of names from the selected column, stopping at first blank."""
+        self.preview_names = []
+        try:
+            if not self.names_file_path or not os.path.exists(self.names_file_path):
+                return
+            if self.names_file_path.endswith(".xlsx"):
+                names_df = pd.read_excel(self.names_file_path)
+            else:
+                names_df = pd.read_csv(self.names_file_path)
+            if self.name_column in names_df.columns:
+                for cell in names_df[self.name_column]:
+                    if pd.isna(cell) or (isinstance(cell, str) and cell.strip() == ""):
+                        break
+                    self.preview_names.append(str(cell).strip())
+        except Exception:
+            # Leave preview_names empty on failure
+            self.preview_names = []
+        # Clamp index
+        if self.preview_index >= len(self.preview_names):
+            self.preview_index = 0
+
+    def refresh_preview_overlay(self):
+        """Redraw overlay text for the current preview index on top of base pixmap, fast."""
+        if self._base_pixmap is None:
+            return
+        pixmap = self._base_pixmap.copy()
+        try:
+            if self.font_path and os.path.exists(self.font_path) and self.preview_names:
+                current_name = self.preview_names[self.preview_index]
+                current_name = capitalize_each_word_preserving_rest(current_name)
+                temp_font_id = QFontDatabase.addApplicationFont(self.font_path)
+                font_family = "Arial"
+                if temp_font_id != -1:
+                    families = QFontDatabase.applicationFontFamilies(temp_font_id)
+                    if families:
+                        font_family = families[0]
+                painter = QPainter(pixmap)
+                # Determine scale between PDF points and preview pixels
+                pdf_height_pts = float(self._pdf_page_height_pts or 1.0)
+                scale_y = pixmap.height() / pdf_height_pts
+                preview_font_px = max(int(self.font_size * scale_y), 1)
+                font = QFont(font_family)
+                font.setPixelSize(preview_font_px)
+                painter.setFont(font)
+                painter.setPen(QPen(Qt.black, 2))
+                center_x = pixmap.width() // 2
+                preview_y = pixmap.height() - int(self.y_position * scale_y)
+                text_rect = painter.fontMetrics().boundingRect(current_name)
+                painter.drawText(center_x - text_rect.width() // 2, preview_y, current_name)
+                painter.end()
+        except Exception:
+            pass
+        # Display
+        self.preview_widget.setPixmap(pixmap)
+        self.preview_widget.resize(pixmap.size())
+        self.update_nav_buttons()
 
     def open_output_folder(self):
         if not self.output_folder_path or not os.path.isdir(self.output_folder_path):
