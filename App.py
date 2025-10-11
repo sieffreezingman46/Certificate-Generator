@@ -534,9 +534,6 @@ class CertificateGeneratorThread(QThread):
                 raise FileNotFoundError("Template PDF not found")
             if not self.output_folder_path or not os.path.isdir(self.output_folder_path):
                 raise FileNotFoundError("Output folder not found")
-            print("X position: ", self.x_position)
-            print("Y position: ", self.y_position)
-            print("Name column: ", self.name_column)
 
             # Load spreadsheet (single-line to avoid any indentation ambiguity)
             names_df = (
@@ -610,10 +607,17 @@ class CertificateGeneratorThread(QThread):
                             except Exception:
                                 continue
 
-                            scale_fraction = float(sig.get("scale", 0.2))
-                            target_w_pts = max(1.0, page_width * max(min(scale_fraction, 1.0), 0.02))
-                            ratio = sh / max(sw, 1)
-                            target_h_pts = max(1.0, target_w_pts * ratio)
+                            # Flexible per-axis scaling if present
+                            w_pts = sig.get("w_pts")
+                            h_pts = sig.get("h_pts")
+                            if w_pts and h_pts:
+                                target_w_pts = max(1.0, float(w_pts))
+                                target_h_pts = max(1.0, float(h_pts))
+                            else:
+                                scale_fraction = float(sig.get("scale", 0.2))
+                                target_w_pts = max(1.0, page_width * max(min(scale_fraction, 1.0), 0.02))
+                                ratio = sh / max(sw, 1)
+                                target_h_pts = max(1.0, target_w_pts * ratio)
 
                             sx_pts = sig.get("x_pts")
                             sy_pts = sig.get("y_pts")
@@ -992,26 +996,44 @@ class SignaturePositionDialog(QDialog):
         self._hover_px = None
         self._hover_py = None
         self._dragging = False
+        
+        # Enhanced placement and resizing state
+        self._placement_mode = True  # True = cursor follows, False = placed with resize box
+        self._resize_mode = False
+        self._resize_handle = None  # Which handle is being dragged
+        self._resize_start_pos = None
+        self._resize_start_rect = None
+        self._placed_rect = None  # QRect of placed signature
+        self._resize_handles = []  # List of handle rects
+        self._hover_handle = None  # Which handle is being hovered
+        # Slight hit-test offset for handles (align visual vs hotspot)
+        self._handle_hit_offset = QPoint(26, 7)
+        # Visual-only draw offset (shift indicator circles without changing hits)
+        self._handle_draw_offset = QPoint(-25, -7)
+        # Active handle offset used to compute consistent drag deltas
+        self._active_handle_offset = QPoint(0, 0)
+        # Confirm button hit-offset (move hitbox without moving the drawn button)
+        self._confirm_hit_offset = QPoint(self._handle_hit_offset.x(), self._handle_hit_offset.y())
+        
+        # Confirm button state
+        self._confirm_btn_rect = None
+        self._confirm_btn_hover = False
+        
+        # Moving state (dragging inside the placed rectangle)
+        self._moving_mode = False
+        self._move_start_pos = None
+        self._move_start_rect = None
 
         self.setWindowTitle("Position Signature")
         self.setModal(True)
         self.resize(900, 650)
 
         layout = QVBoxLayout(self)
-        info = QLabel("Drag to place the signature. Use slider to resize. Click to set.")
+        info = QLabel("Click to place the signature, then resize with handles and confirm.")
         info.setStyleSheet("padding: 8px; font-weight: bold; color: #ffffff; background-color: #2d2d2d;")
         layout.addWidget(info)
 
-        # Slider for proportional scaling
-        slider_row = QHBoxLayout()
-        slider_row.addWidget(QLabel("Size:"))
-        self.size_slider = QSlider(Qt.Horizontal)
-        self.size_slider.setMinimum(5)
-        self.size_slider.setMaximum(100)
-        self.size_slider.setValue(int(max(min(self.sig_entry.get("scale", 0.2), 1.0), 0.05) * 100))
-        self.size_slider.valueChanged.connect(self._on_size_changed)
-        slider_row.addWidget(self.size_slider, 1)
-        layout.addLayout(slider_row)
+        # Size slider removed for signature dialog per request
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
@@ -1022,6 +1044,7 @@ class SignaturePositionDialog(QDialog):
         self.preview_label.setMouseTracking(True)
         self.preview_label.mouseMoveEvent = self.on_mouse_move
         self.preview_label.mousePressEvent = self.on_mouse_click
+        self.preview_label.mouseReleaseEvent = self.mouseReleaseEvent
         self.preview_label.setCursor(Qt.SizeAllCursor)
         self.scroll_area.setWidget(self.preview_label)
         layout.addWidget(self.scroll_area, 1)
@@ -1051,18 +1074,45 @@ class SignaturePositionDialog(QDialog):
             self._base_pixmap = base
             self._scale_x = self._base_pixmap.width() / max(self._pdf_width_pts, 1.0)
             self._scale_y = self._base_pixmap.height() / max(self._pdf_height_pts, 1.0)
-            # Default placement if not set
+            # Compute current signature pixel size for centering calculations
+            spix = self.sig_entry.get("pixmap")
+            target_w_px = 0
+            target_h_px = 0
+            try:
+                if spix and not spix.isNull():
+                    # Prefer saved per-axis sizes if present for flexible scaling
+                    w_pts = self.sig_entry.get("w_pts")
+                    h_pts = self.sig_entry.get("h_pts")
+                    if w_pts and h_pts:
+                        target_w_px = max(1, int(float(w_pts) * self._scale_x))
+                        target_h_px = max(1, int(float(h_pts) * self._scale_y))
+                    else:
+                        scale_fraction = float(self.sig_entry.get("scale", 0.2))
+                        target_w_px = int(self._base_pixmap.width() * max(min(scale_fraction, 1.0), 0.02))
+                        ratio = spix.height() / max(spix.width(), 1)
+                        target_h_px = max(1, int(target_w_px * ratio))
+            except Exception:
+                pass
+            # Default placement if not set; hover is the CENTER of the signature
             if self.sig_entry.get("x_pts") is None or self.sig_entry.get("y_pts") is None:
                 hx = int(self._base_pixmap.width() * 0.65)
                 hy = int(self._base_pixmap.height() * 0.25)
             else:
-                hx = int(float(self.sig_entry["x_pts"]) * self._scale_x)
-                hy = self._base_pixmap.height() - int(float(self.sig_entry["y_pts"]) * self._scale_y)
+                # Convert saved top-left PDF pts and size to placed rect and center
+                top_left_x_px = int(float(self.sig_entry["x_pts"]) * self._scale_x)
+                top_left_y_px = self._base_pixmap.height() - int(float(self.sig_entry["y_pts"]) * self._scale_y)
+                hx = int(top_left_x_px + (target_w_px / 2))
+                hy = int(top_left_y_px + (target_h_px / 2))
+                # If saved sizes exist, start in resize mode with placed rect
+                if self.sig_entry.get("w_pts") and self.sig_entry.get("h_pts"):
+                    self._placed_rect = QRect(top_left_x_px, top_left_y_px, int(target_w_px), int(target_h_px))
+                    self._placement_mode = False
             self._hover_px, self._hover_py = hx, hy
             self._redraw()
         except Exception as e:
             QMessageBox.critical(self, "Signature", f"Error loading preview: {e}")
 
+    # Size slider removed; keep method for backward compatibility if referenced
     def _on_size_changed(self, value):
         self.sig_entry["scale"] = max(0.05, min(1.0, value / 100.0))
         self._redraw()
@@ -1073,22 +1123,122 @@ class SignaturePositionDialog(QDialog):
         pixmap = self._base_pixmap.copy()
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
-        # Draw the signature scaled, anchored at top-left of hover point
+        
         try:
             spix = self.sig_entry.get("pixmap")
             if spix and not spix.isNull():
-                scale_fraction = float(self.sig_entry.get("scale", 0.2))
-                target_w = int(pixmap.width() * max(min(scale_fraction, 1.0), 0.02))
-                ratio = spix.height() / max(spix.width(), 1)
-                target_h = max(1, int(target_w * ratio))
-                spix_scaled = spix.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                painter.drawPixmap(int(self._hover_px), int(self._hover_py), spix_scaled)
+                if self._placement_mode:
+                    # Original behavior: signature follows cursor
+                    scale_fraction = float(self.sig_entry.get("scale", 0.2))
+                    target_w = int(pixmap.width() * max(min(scale_fraction, 1.0), 0.02))
+                    ratio = spix.height() / max(spix.width(), 1)
+                    target_h = max(1, int(target_w * ratio))
+                    spix_scaled = spix.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    draw_x = int(self._hover_px - (spix_scaled.width() / 2))
+                    draw_y = int(self._hover_py - (spix_scaled.height() / 2))
+                    painter.drawPixmap(draw_x, draw_y, spix_scaled)
+                else:
+                    # Resize mode: signature is placed with resize handles
+                    if self._placed_rect:
+                        spix_scaled = spix.scaled(self._placed_rect.width(), self._placed_rect.height(), 
+                                                Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+                        painter.drawPixmap(self._placed_rect.topLeft(), spix_scaled)
+                        
+                        # Draw resize handles and bounding box
+                        self._draw_resize_ui(painter)
         except Exception:
             pass
+        
         painter.end()
         self._pixmap = pixmap
         self.preview_label.setPixmap(self._pixmap)
         self.preview_label.resize(self._pixmap.size())
+
+    def _draw_resize_ui(self, painter):
+        """Draw the resize handles, bounding box, and confirm button."""
+        if not self._placed_rect:
+            return
+            
+        rect = self._placed_rect
+        handle_diameter = 14  # hitbox 12–16px; use 14
+        handle_radius = handle_diameter // 2
+        
+        # Clear previous handles (stored without offset; offset applied for draw/hit)
+        self._resize_handles = []
+        
+        # Draw bounding box
+        box_pen = QPen(QColor(255, 255, 255, 200), 2)
+        if self._hover_handle is not None or self._resize_mode:
+            box_pen.setColor(QColor("#7B2CBF"))
+        painter.setPen(box_pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(rect)
+        
+        # Calculate handle positions (centers)
+        handles = [
+            ("nw", rect.topLeft()),
+            ("ne", rect.topRight()),
+            ("sw", rect.bottomLeft()),
+            ("se", rect.bottomRight()),
+            ("n", QPoint(rect.center().x(), rect.top())),
+            ("s", QPoint(rect.center().x(), rect.bottom())),
+            ("w", QPoint(rect.left(), rect.center().y())),
+            ("e", QPoint(rect.right(), rect.center().y())),
+        ]
+        
+        # Draw circular handles and store hit rects
+        for i, (handle_type, pos) in enumerate(handles):
+            # Base hit rect (no offset stored)
+            base_rect = QRect(pos.x() - handle_radius, pos.y() - handle_radius,
+                              handle_diameter, handle_diameter)
+            self._resize_handles.append((handle_type, base_rect))
+
+            # Draw rect uses hit offset + visual draw offset (hitboxes unchanged)
+            draw_rect = QRect(base_rect)
+            dx = int(self._handle_hit_offset.x() + self._handle_draw_offset.x())
+            dy = int(self._handle_hit_offset.y() + self._handle_draw_offset.y())
+            draw_rect.translate(dx, dy)
+            
+            # Hover glow
+            if self._hover_handle == i:
+                glow_color = QColor("#7B2CBF")
+                glow_color.setAlpha(120)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(glow_color))
+                glow_rect = QRect(draw_rect.adjusted(-2, -2, 2, 2))
+                painter.drawEllipse(glow_rect)
+            
+            # Handle fill
+            handle_color = QColor("#7B2CBF")
+            painter.setPen(QPen(QColor(255, 255, 255, 220), 1))
+            painter.setBrush(QBrush(handle_color))
+            painter.drawEllipse(draw_rect)
+        
+        # Draw confirm button
+        btn_width = 90
+        btn_height = 30
+        btn_x = rect.center().x() - btn_width // 2
+        btn_y = rect.bottom() + 15
+        
+        self._confirm_btn_rect = QRect(btn_x, btn_y, btn_width, btn_height)
+        
+        # Button styling
+        if self._confirm_btn_hover:
+            btn_color = QColor("#9b59b6")
+            text_color = QColor(255, 255, 255)
+        else:
+            btn_color = QColor("#7B2CBF")
+            text_color = QColor(240, 240, 240)
+            
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(btn_color))
+        painter.drawRoundedRect(self._confirm_btn_rect, 6, 6)
+        
+        # Button text
+        painter.setPen(QPen(text_color))
+        font = QFont("Segoe UI", 10, QFont.Bold)
+        painter.setFont(font)
+        painter.drawText(self._confirm_btn_rect, Qt.AlignCenter, "Confirm")
 
     def on_mouse_move(self, event):
         if not self._base_pixmap:
@@ -1096,16 +1246,329 @@ class SignaturePositionDialog(QDialog):
         pt = event.position()
         x = max(0, min(self._base_pixmap.width(), int(pt.x())))
         y = max(0, min(self._base_pixmap.height(), int(pt.y())))
-        self._hover_px, self._hover_py = x, y
-        self._redraw()
+        
+        if self._placement_mode:
+            # Original behavior: signature follows cursor
+            self._hover_px, self._hover_py = x, y
+            self._redraw()
+        elif self._resize_mode and self._resize_handle is not None:
+            # Handle resize dragging
+            self._handle_resize_drag(QPoint(x, y))
+        else:
+            # Move or hover/confirm
+            if getattr(self, "_moving_mode", False) and getattr(self, "_move_start_rect", None) is not None:
+                self._handle_move_drag(QPoint(x, y))
+            else:
+                # Check for handle hover and confirm button hover
+                self._update_hover_state(QPoint(x, y))
 
     def on_mouse_click(self, event):
         if not self._base_pixmap:
             return
         if event.button() == Qt.LeftButton:
-            # Convert hover top-left to PDF pts and store in entry
-            self.sig_entry["x_pts"] = float(self._hover_px / self._scale_x)
-            self.sig_entry["y_pts"] = float((self._base_pixmap.height() - self._hover_py) / self._scale_y)
+            pt = event.position()
+            x = max(0, min(self._base_pixmap.width(), int(pt.x())))
+            y = max(0, min(self._base_pixmap.height(), int(pt.y())))
+            
+            if self._placement_mode:
+                # Place the signature and switch to resize mode
+                self._place_signature(QPoint(x, y))
+            elif self._confirm_btn_rect and QRect(self._confirm_btn_rect).translated(self._confirm_hit_offset).contains(QPoint(x, y)):
+                # Confirm button clicked - finalize placement
+                self._confirm_placement()
+            else:
+                # Try starting a resize; if not, start moving when inside rect
+                pos = QPoint(x, y)
+                if not self._start_resize(pos):
+                    if self._placed_rect and self._placed_rect.contains(pos):
+                        self._moving_mode = True
+                        self._move_start_pos = pos
+                        self._move_start_rect = QRect(self._placed_rect)
+                        try:
+                            self.preview_label.setCursor(Qt.ClosedHandCursor)
+                        except Exception:
+                            pass
+
+    def mousePressEvent(self, event):
+        """Handle mouse press for resize operations."""
+        if event.button() == Qt.LeftButton and not self._placement_mode:
+            pt = event.position()
+            x = max(0, min(self._base_pixmap.width(), int(pt.x())))
+            y = max(0, min(self._base_pixmap.height(), int(pt.y())))
+            pos = QPoint(x, y)
+            # Try to start resizing first; if not, try moving inside rect
+            if not self._start_resize(pos):
+                if self._placed_rect and self._placed_rect.contains(pos):
+                    self._moving_mode = True
+                    self._move_start_pos = pos
+                    self._move_start_rect = QRect(self._placed_rect)
+                    self.preview_label.setCursor(Qt.ClosedHandCursor)
+
+    def mouseReleaseEvent(self, event):
+        """Handle mouse release to end resize operations."""
+        if event.button() == Qt.LeftButton:
+            if self._resize_mode:
+                self._resize_mode = False
+                self._resize_handle = None
+                self.preview_label.unsetCursor()
+            if getattr(self, "_moving_mode", False):
+                self._moving_mode = False
+                self._move_start_pos = None
+                self._move_start_rect = None
+                self.preview_label.unsetCursor()
+            self._redraw()
+
+    def _place_signature(self, pos):
+        """Place the signature at the given position and switch to resize mode."""
+        try:
+            spix = self.sig_entry.get("pixmap")
+            if spix and not spix.isNull():
+                scale_fraction = float(self.sig_entry.get("scale", 0.2))
+                target_w = int(self._base_pixmap.width() * max(min(scale_fraction, 1.0), 0.02))
+                ratio = spix.height() / max(spix.width(), 1)
+                target_h = max(1, int(target_w * ratio))
+                
+                # Create placed rect centered on click position
+                self._placed_rect = QRect(
+                    pos.x() - target_w // 2,
+                    pos.y() - target_h // 2,
+                    target_w,
+                    target_h
+                )
+                
+                # Ensure rect stays within bounds
+                if self._placed_rect.left() < 0:
+                    self._placed_rect.moveLeft(0)
+                if self._placed_rect.top() < 0:
+                    self._placed_rect.moveTop(0)
+                if self._placed_rect.right() > self._base_pixmap.width():
+                    self._placed_rect.moveRight(self._base_pixmap.width())
+                if self._placed_rect.bottom() > self._base_pixmap.height():
+                    self._placed_rect.moveBottom(self._base_pixmap.height())
+                
+                self._placement_mode = False
+                self._redraw()
+        except Exception:
+            pass
+
+    def _update_hover_state(self, pos):
+        """Update hover states for handles and confirm button."""
+        old_hover_handle = self._hover_handle
+        old_confirm_hover = self._confirm_btn_hover
+        
+        self._hover_handle = None
+        self._confirm_btn_hover = False
+        
+        # Check handle hover
+        for i, (handle_type, handle_rect) in enumerate(self._resize_handles):
+            # Apply slight right offset to hover hit test
+            adj = QRect(handle_rect)
+            adj.translate(self._handle_hit_offset)
+            if adj.contains(pos):
+                self._hover_handle = i
+                self._set_cursor_for_handle(handle_type)
+                break
+        else:
+            # Check confirm button hover, then interior move cursor, else default
+            if self._confirm_btn_rect and QRect(self._confirm_btn_rect).translated(self._confirm_hit_offset).contains(pos):
+                self._confirm_btn_hover = True
+                self.preview_label.setCursor(Qt.PointingHandCursor)
+            elif self._placed_rect and self._placed_rect.contains(pos):
+                # Inside image → show 4-arrows move cursor
+                self.preview_label.setCursor(Qt.SizeAllCursor)
+            else:
+                self.preview_label.unsetCursor()
+        
+        # Redraw if hover state changed
+        if old_hover_handle != self._hover_handle or old_confirm_hover != self._confirm_btn_hover:
+            self._redraw()
+
+    def _set_cursor_for_handle(self, handle_type):
+        """Set appropriate cursor for the handle type."""
+        # Mapping per requirement:
+        # tl/br → SizeFDiagCursor, tr/bl → SizeBDiagCursor
+        cursor_map = {
+            "nw": Qt.SizeFDiagCursor,
+            "se": Qt.SizeFDiagCursor,
+            "ne": Qt.SizeBDiagCursor,
+            "sw": Qt.SizeBDiagCursor,
+            "n": Qt.SizeVerCursor,
+            "s": Qt.SizeVerCursor,
+            "w": Qt.SizeHorCursor,
+            "e": Qt.SizeHorCursor,
+        }
+        self.preview_label.setCursor(cursor_map.get(handle_type, Qt.SizeAllCursor))
+
+    def _start_resize(self, pos):
+        """Start resize operation if clicking on a handle."""
+        for i, (handle_type, handle_rect) in enumerate(self._resize_handles):
+            # Apply slight right offset to click hit test
+            adj = QRect(handle_rect)
+            adj.translate(self._handle_hit_offset)
+            if adj.contains(pos):
+                self._resize_mode = True
+                self._resize_handle = i
+                self._resize_start_pos = QPoint(pos.x() - self._handle_hit_offset.x(), pos.y() - self._handle_hit_offset.y())
+                self._resize_start_rect = QRect(self._placed_rect)
+                # Remember handle center to compute deltas consistently
+                self._active_handle_offset = QPoint(adj.center().x() - pos.x(), adj.center().y() - pos.y())
+                return True
+        
+        return False
+    def _handle_resize_drag(self, pos):
+        """Handle resize dragging based on the active handle."""
+        if not self._resize_start_rect or self._resize_handle is None:
+            return
+            
+        handle_type = self._resize_handles[self._resize_handle][0]
+        # Apply inverse of the hotspot offset to align drag delta with visual handle
+        # Adjust by both hit offset and any initial click offset relative to handle center
+        adjusted_pos = QPoint(
+            pos.x() - self._handle_hit_offset.x() + self._active_handle_offset.x(),
+            pos.y() - self._handle_hit_offset.y() + self._active_handle_offset.y(),
+        )
+        delta = adjusted_pos - self._resize_start_pos
+        new_rect = QRect(self._resize_start_rect)
+        
+        # Handle different resize types
+        if handle_type == "nw":
+            # Top-left corner - maintain aspect ratio
+            self._resize_corner(new_rect, delta, "nw", True)
+        elif handle_type == "ne":
+            # Top-right corner - maintain aspect ratio
+            self._resize_corner(new_rect, delta, "ne", True)
+        elif handle_type == "sw":
+            # Bottom-left corner - maintain aspect ratio
+            self._resize_corner(new_rect, delta, "sw", True)
+        elif handle_type == "se":
+            # Bottom-right corner - maintain aspect ratio
+            self._resize_corner(new_rect, delta, "se", True)
+        elif handle_type == "n":
+            # Top side - height only (drag up reduces, drag down increases)
+            new_rect.setTop(self._resize_start_rect.top() + delta.y())
+        elif handle_type == "s":
+            # Bottom side - height only (drag down increases)
+            new_rect.setBottom(self._resize_start_rect.bottom() + delta.y())
+        elif handle_type == "w":
+            # Left side - width only (drag left increases width to left)
+            new_rect.setLeft(self._resize_start_rect.left() + delta.x())
+        elif handle_type == "e":
+            # Right side - width only (drag right increases width)
+            new_rect.setRight(self._resize_start_rect.right() + delta.x())
+        
+        # Ensure minimum size and keep center consistent where possible
+        min_size = 24
+        if new_rect.width() < min_size:
+            if handle_type in ["nw", "w", "sw"]:
+                new_rect.setLeft(new_rect.right() - min_size)
+            else:
+                new_rect.setRight(new_rect.left() + min_size)
+        if new_rect.height() < min_size:
+            if handle_type in ["nw", "n", "ne"]:
+                new_rect.setTop(new_rect.bottom() - min_size)
+            else:
+                new_rect.setBottom(new_rect.top() + min_size)
+        
+        # Keep within bounds while preserving the side being dragged
+        bounds = self._base_pixmap.rect()
+        if new_rect.left() < bounds.left():
+            new_rect.setLeft(bounds.left())
+        if new_rect.top() < bounds.top():
+            new_rect.setTop(bounds.top())
+        if new_rect.right() > bounds.right():
+            new_rect.setRight(bounds.right())
+        if new_rect.bottom() > bounds.bottom():
+            new_rect.setBottom(bounds.bottom())
+        
+        self._placed_rect = new_rect
+        self._redraw()
+
+    def _handle_move_drag(self, pos):
+        """Drag the placed rect by its interior (move)."""
+        if not getattr(self, "_move_start_pos", None) or not getattr(self, "_move_start_rect", None):
+            return
+        delta = pos - self._move_start_pos
+        new_rect = QRect(self._move_start_rect)
+        new_rect.translate(delta)
+        # Keep within bounds
+        bounds = self._base_pixmap.rect()
+        if new_rect.left() < bounds.left():
+            new_rect.moveLeft(bounds.left())
+        if new_rect.top() < bounds.top():
+            new_rect.moveTop(bounds.top())
+        if new_rect.right() > bounds.right():
+            new_rect.moveRight(bounds.right())
+        if new_rect.bottom() > bounds.bottom():
+            new_rect.moveBottom(bounds.bottom())
+        self._placed_rect = new_rect
+        self._redraw()
+
+    def _resize_corner(self, rect, delta, corner, maintain_aspect):
+        """Resize from a corner, optionally maintaining aspect ratio."""
+        if maintain_aspect:
+            # Maintain aspect ratio uniformly across corners
+            original_ratio = self._resize_start_rect.width() / max(self._resize_start_rect.height(), 1)
+
+            # Determine signed scale based on corner and drag direction
+            scale_x = delta.x()
+            scale_y = delta.y()
+
+            if corner == "nw":
+                # Negative x expands leftwards; negative y expands upwards
+                scale = -min(abs(scale_x), abs(scale_y)) * (1 if (scale_x < 0 and scale_y < 0) else (-1 if (scale_x > 0 or scale_y > 0) else 1))
+                rect.setLeft(rect.left() + scale)
+                rect.setTop(rect.top() + (scale / original_ratio))
+            elif corner == "ne":
+                # Positive x expands to the right; negative y expands upwards
+                scale = min(abs(scale_x), abs(scale_y)) * (1 if (scale_x > 0 and scale_y < 0) else (-1 if (scale_x < 0 or scale_y > 0) else 1))
+                rect.setRight(rect.right() + scale)
+                rect.setTop(rect.top() - (scale / original_ratio))
+            elif corner == "sw":
+                # Negative x expands to the left; positive y expands downward
+                # Use signed scale, but move left edge opposite to sign so positive scale moves left
+                scale = min(abs(scale_x), abs(scale_y)) * (1 if (scale_x < 0 and scale_y > 0) else (-1 if (scale_x > 0 or scale_y < 0) else 1))
+                rect.setLeft(rect.left() - scale)
+                rect.setBottom(rect.bottom() + (scale / original_ratio))
+            elif corner == "se":
+                # Positive x and y expand bottom-right
+                scale = min(abs(scale_x), abs(scale_y)) * (1 if (scale_x > 0 and scale_y > 0) else (-1 if (scale_x < 0 or scale_y < 0) else 1))
+                rect.setRight(rect.right() + scale)
+                rect.setBottom(rect.bottom() + (scale / original_ratio))
+        else:
+            # Free resize without aspect ratio constraint
+            if corner == "nw":
+                rect.setTopLeft(rect.topLeft() + delta)
+            elif corner == "ne":
+                rect.setTopRight(rect.topRight() + delta)
+            elif corner == "sw":
+                rect.setBottomLeft(rect.bottomLeft() + delta)
+            elif corner == "se":
+                rect.setBottomRight(rect.bottomRight() + delta)
+
+    def _confirm_placement(self):
+        """Confirm the placement and save the final position/size."""
+        if not self._placed_rect:
+            return
+            
+        try:
+            # Calculate the scale based on final size vs original page width
+            page_width_px = self._base_pixmap.width()
+            page_height_px = self._base_pixmap.height()
+            
+            # Convert to PDF coordinates (top-left based) and save per-axis sizes
+            top_left_x_px = self._placed_rect.left()
+            top_left_y_px = self._placed_rect.top()
+            
+            self.sig_entry["x_pts"] = float(top_left_x_px / self._scale_x)
+            self.sig_entry["y_pts"] = float((self._base_pixmap.height() - top_left_y_px) / self._scale_y)
+            self.sig_entry["w_pts"] = float(self._placed_rect.width() / self._scale_x)
+            self.sig_entry["h_pts"] = float(self._placed_rect.height() / self._scale_y)
+            
+            # Slider removed; nothing to sync here
+            
+            self.accept()
+        except Exception:
+            # Fallback - just accept with current values
             self.accept()
 
 
@@ -2210,6 +2673,9 @@ class CertificateGeneratorApp(QMainWindow):
                     "path": path,
                     "x_pts": (float(sig.get("x_pts")) if sig.get("x_pts") is not None else None),
                     "y_pts": (float(sig.get("y_pts")) if sig.get("y_pts") is not None else None),
+                    # Also include per-axis sizes when present for flexible scaling in generation
+                    "w_pts": (float(sig.get("w_pts")) if sig.get("w_pts") is not None else None),
+                    "h_pts": (float(sig.get("h_pts")) if sig.get("h_pts") is not None else None),
                     "scale": float(sig.get("scale", 0.2)),
                 })
             setattr(self.generator_thread, "signatures", safe_sigs)
@@ -2260,24 +2726,44 @@ class CertificateGeneratorApp(QMainWindow):
 
     # Live clearing of required state on user input
     def on_names_text_changed(self, text):
-        if text.strip():
+        t = (text or "").strip()
+        # Keep model in sync with UI text
+        self.names_file_path = t if t else ""
+        if t:
             self._set_required_state(self.names_edit, self.names_required_lbl, False)
         self._update_required_feedback()
+        # Persist state
+        self._save_session_data()
 
     def on_template_text_changed(self, text):
-        if text.strip():
+        t = (text or "").strip()
+        # Keep model in sync with UI text
+        self.template_pdf_path = t if t else ""
+        if t:
             self._set_required_state(self.template_edit, self.template_required_lbl, False)
         self._update_required_feedback()
+        # Persist state
+        self._save_session_data()
 
     def on_output_text_changed(self, text):
-        if text.strip():
+        t = (text or "").strip()
+        # Keep model in sync with UI text
+        self.output_folder_path = t if t else ""
+        if t:
             self._set_required_state(self.output_edit, self.output_required_lbl, False)
         self._update_required_feedback()
+        # Persist state
+        self._save_session_data()
 
     def on_font_text_changed(self, text):
-        if text.strip():
+        t = (text or "").strip()
+        # Keep model in sync with UI text
+        self.font_path = t if t else ""
+        if t:
             self._set_required_state(self.font_edit, self.font_required_lbl, False)
         self._update_required_feedback()
+        # Persist state
+        self._save_session_data()
 
     def on_zoom_in(self):
         self.preview_zoom = min(self.preview_zoom * 1.2, 4.0)
@@ -2334,8 +2820,8 @@ class CertificateGeneratorApp(QMainWindow):
             for b in self._signature_bounds:
                 if QRect(b["x"], b["y"], b["w"], b["h"]).contains(QPoint(content_x, content_y)):
                     drag_index = b["index"]
-                    # store offset from top-left for smooth dragging
-                    self._drag_sig_offset = QPoint(content_x - b["x"], content_y - b["y"]) 
+                    # store offset as half-size so cursor stays centered while dragging
+                    self._drag_sig_offset = QPoint(int(b["w"] / 2), int(b["h"] / 2))
                     break
             if drag_index != -1:
                 self._drag_sig_index = drag_index
@@ -2387,8 +2873,13 @@ class CertificateGeneratorApp(QMainWindow):
                     scale_x = base.width() / pdf_width_pts
                     scale_y = base.height() / pdf_height_pts
                     # Map point relative to preview widget contents
-                    new_x_px = max(0, min(base.width(), content_x - self._drag_sig_offset.x()))
-                    new_y_px = max(0, min(base.height(), content_y - self._drag_sig_offset.y()))
+                    # content_x/content_y is the cursor; we want top-left = cursor - half signature size
+                    # Retrieve current signature scaled size from bounds
+                    b = next((bb for bb in self._signature_bounds if bb["index"] == self._drag_sig_index), None)
+                    half_w = int((b["w"]) / 2) if b else self._drag_sig_offset.x()
+                    half_h = int((b["h"]) / 2) if b else self._drag_sig_offset.y()
+                    new_x_px = max(0, min(base.width(), content_x - half_w))
+                    new_y_px = max(0, min(base.height(), content_y - half_h))
                     sig["x_pts"] = float(new_x_px / scale_x)
                     sig["y_pts"] = float((base.height() - new_y_px) / scale_y)
                     self.refresh_preview_overlay()
@@ -2571,19 +3062,28 @@ class CertificateGeneratorApp(QMainWindow):
                         spix = sig.get("pixmap")
                         if spix is None or spix.isNull():
                             continue
-                        scale_fraction = float(sig.get("scale", 0.2))
-                        # Target width based on page width
-                        target_w = int(pixmap.width() * max(min(scale_fraction, 1.0), 0.02))
-                        if target_w <= 0:
-                            continue
-                        ratio = spix.height() / max(spix.width(), 1)
-                        target_h = max(1, int(target_w * ratio))
-                        spix_scaled = spix.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                        # Use per-axis flexible scaling if present
+                        w_pts = sig.get("w_pts")
+                        h_pts = sig.get("h_pts")
+                        if w_pts and h_pts:
+                            target_w = max(1, int(float(w_pts) * scale_x))
+                            target_h = max(1, int(float(h_pts) * scale_y))
+                            spix_scaled = spix.scaled(target_w, target_h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+                        else:
+                            scale_fraction = float(sig.get("scale", 0.2))
+                            # Target width based on page width
+                            target_w = int(pixmap.width() * max(min(scale_fraction, 1.0), 0.02))
+                            if target_w <= 0:
+                                continue
+                            ratio = spix.height() / max(spix.width(), 1)
+                            target_h = max(1, int(target_w * ratio))
+                            spix_scaled = spix.scaled(target_w, target_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
                         if sig.get("x_pts") is None or sig.get("y_pts") is None:
-                            # Default placement if not configured yet
+                            # Default placement if not configured yet (centered under cursor on first attach)
                             x_px = int(pixmap.width() * 0.65)
                             y_px = int(pixmap.height() * 0.25)
                         else:
+                            # Stored x/y are top-left; draw at those
                             x_px = int(float(sig["x_pts"]) * scale_x)
                             y_px = pixmap.height() - int(float(sig["y_pts"]) * scale_y)
                         painter.drawPixmap(x_px, y_px, spix_scaled)
