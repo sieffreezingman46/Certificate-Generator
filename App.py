@@ -3,6 +3,7 @@ import subprocess
 import importlib
 import io
 import os
+import json
 from pathlib import Path
 import time
  
@@ -45,6 +46,43 @@ def _print_exit_and_wait():
         time.sleep(2)
     except Exception:
         pass
+
+
+def get_session_file_path():
+    """Get the path to the session memory file."""
+    try:
+        # Store in user's home directory for persistence
+        home_dir = Path.home()
+        session_dir = home_dir / ".certificate_generator"
+        session_dir.mkdir(exist_ok=True)
+        return session_dir / "session.json"
+    except Exception:
+        # Fallback to current directory if home directory access fails
+        return Path("session.json")
+
+
+def save_session_data(data):
+    """Save session data to file with error handling."""
+    try:
+        session_file = get_session_file_path()
+        with open(session_file, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception:
+        # Fail silently - session memory is optional
+        pass
+
+
+def load_session_data():
+    """Load session data from file with error handling."""
+    try:
+        session_file = get_session_file_path()
+        if not session_file.exists():
+            return {}
+        with open(session_file, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        # Return empty dict if loading fails
+        return {}
 
 def pre_start_update_check():
     """Print-only update check that runs before package checks.
@@ -200,7 +238,7 @@ def check_for_updates_on_startup(parent_window=None):
             upstream_ref = res_upstream.stdout.strip()
         else:
             upstream_ref = f"origin/{branch}"
-
+            
         # Compare local and upstream commits
         res_local = run_git("rev-parse", "HEAD", raise_on_error=False)
         res_remote = run_git("rev-parse", upstream_ref, raise_on_error=False)
@@ -496,6 +534,9 @@ class CertificateGeneratorThread(QThread):
                 raise FileNotFoundError("Template PDF not found")
             if not self.output_folder_path or not os.path.isdir(self.output_folder_path):
                 raise FileNotFoundError("Output folder not found")
+            print("X position: ", self.x_position)
+            print("Y position: ", self.y_position)
+            print("Name column: ", self.name_column)
 
             # Load spreadsheet (single-line to avoid any indentation ambiguity)
             names_df = (
@@ -859,18 +900,8 @@ class PositionPreviewDialog(QDialog):
                 name_text = "Sample Name"
             name_text = capitalize_each_word_preserving_rest(str(name_text))
 
-            # Font selection
-            font_family = "Arial"
-            try:
-                if getattr(self.parent_window, "font_path", None) and os.path.exists(self.parent_window.font_path):
-                    temp_font_id = QFontDatabase.addApplicationFont(self.parent_window.font_path)
-                    if temp_font_id != -1:
-                        families = QFontDatabase.applicationFontFamilies(temp_font_id)
-                        if families:
-                            font_family = families[0]
-            except Exception:
-                pass
-
+            # Use neutral font for position preview (not user-selected font)
+            font_family = "Arial"  # Always use Arial for clean, consistent preview
             font = QFont(font_family)
             preview_font_px = max(int(self.parent_window.font_size * self._scale_y), 1)
             font.setPixelSize(preview_font_px)
@@ -1110,9 +1141,15 @@ class CertificateGeneratorApp(QMainWindow):
         self._drag_sig_offset = QPoint(0, 0)
         self._sig_resize_index = -1
         
+        # Load session data before setting up UI
+        self._load_session_data()
+        
         self.setup_ui()
         self.apply_styles()
         self.setup_defaults()
+        
+        # Restore signature chips and trigger preview loading after UI is ready
+        QTimer.singleShot(100, self._restore_session_ui)
 
     def setup_ui(self):
         self.setWindowTitle("Certificate Generator")
@@ -1138,7 +1175,7 @@ class CertificateGeneratorApp(QMainWindow):
         
         # Names file
         inputs_layout.addWidget(QLabel("Excel file:"), 0, 0)
-        self.names_edit = QLineEdit()
+        self.names_edit = QLineEdit(self.names_file_path)
         self.names_edit.setPlaceholderText("Select Excel or CSV file...")
         self.names_edit.textChanged.connect(self.on_names_text_changed)
         inputs_layout.addWidget(self.names_edit, 0, 1)
@@ -1152,7 +1189,7 @@ class CertificateGeneratorApp(QMainWindow):
         
         # Template PDF
         inputs_layout.addWidget(QLabel("Template PDF:"), 1, 0)
-        self.template_edit = QLineEdit()
+        self.template_edit = QLineEdit(self.template_pdf_path)
         self.template_edit.setPlaceholderText("Select PDF template...")
         self.template_edit.textChanged.connect(self.on_template_text_changed)
         inputs_layout.addWidget(self.template_edit, 1, 1)
@@ -1166,7 +1203,7 @@ class CertificateGeneratorApp(QMainWindow):
         
         # Output folder
         inputs_layout.addWidget(QLabel("Output folder:"), 2, 0)
-        self.output_edit = QLineEdit()
+        self.output_edit = QLineEdit(self.output_folder_path)
         self.output_edit.setPlaceholderText("Select output folder...")
         self.output_edit.textChanged.connect(self.on_output_text_changed)
         inputs_layout.addWidget(self.output_edit, 2, 1)
@@ -1180,7 +1217,7 @@ class CertificateGeneratorApp(QMainWindow):
         
         # Font file
         inputs_layout.addWidget(QLabel("Font file:"), 3, 0)
-        self.font_edit = QLineEdit()
+        self.font_edit = QLineEdit(self.font_path)
         self.font_edit.setPlaceholderText("Select font file (.ttf/.otf)...")
         self.font_edit.textChanged.connect(self.on_font_text_changed)
         inputs_layout.addWidget(self.font_edit, 3, 1)
@@ -1202,21 +1239,22 @@ class CertificateGeneratorApp(QMainWindow):
         
         # Font size
         options_layout.addWidget(QLabel("Font size:"), 0, 0)
-        self.font_size_edit = QLineEdit("30")
+        self.font_size_edit = QLineEdit(str(self.font_size))
         self.font_size_edit.setPlaceholderText("e.g. 30")
         self.font_size_edit.textChanged.connect(self.on_font_size_text_changed)
         options_layout.addWidget(self.font_size_edit, 0, 1)
         
         # X position
         options_layout.addWidget(QLabel("X position:"), 1, 0)
-        self.x_pos_edit = QLineEdit("")
+        x_text = "" if self.x_position is None else str(int(self.x_position))
+        self.x_pos_edit = QLineEdit(x_text)
         self.x_pos_edit.setPlaceholderText("e.g. center")
         self.x_pos_edit.textChanged.connect(self.on_x_position_text_changed)
         options_layout.addWidget(self.x_pos_edit, 1, 1)
 
         # Y position
         options_layout.addWidget(QLabel("Y position:"), 2, 0)
-        self.y_pos_edit = QLineEdit("300")
+        self.y_pos_edit = QLineEdit(str(self.y_position))
         self.y_pos_edit.setPlaceholderText("e.g. 300")
         self.y_pos_edit.textChanged.connect(self.on_y_position_text_changed)
         options_layout.addWidget(self.y_pos_edit, 2, 1)
@@ -1227,7 +1265,7 @@ class CertificateGeneratorApp(QMainWindow):
         
         # Name column
         options_layout.addWidget(QLabel("Name column:"), 3, 0)
-        self.name_col_edit = QLineEdit("Name")
+        self.name_col_edit = QLineEdit(self.name_column)
         self.name_col_edit.setPlaceholderText("Column header (default: Name)")
         self.name_col_edit.textChanged.connect(self.on_name_column_changed)
         options_layout.addWidget(self.name_col_edit, 3, 1, 1, 2)
@@ -1670,6 +1708,195 @@ class CertificateGeneratorApp(QMainWindow):
         # No default font; user should choose a font file
         pass
 
+    def _load_session_data(self):
+        """Load session data and apply to instance variables."""
+        try:
+            session_data = load_session_data()
+            if not session_data:
+                return
+            
+            # Apply session data with validation
+            self.names_file_path = session_data.get("names_file_path", "")
+            self.template_pdf_path = session_data.get("template_pdf_path", "")
+            self.output_folder_path = session_data.get("output_folder_path", "")
+            self.font_path = session_data.get("font_path", "")
+            self.font_size = max(8, min(200, session_data.get("font_size", 30)))
+            self.y_position = max(0, min(2000, session_data.get("y_position", 300)))
+            self.x_position = session_data.get("x_position", None)
+            self.name_column = session_data.get("name_column", "Name")
+            
+            # Validate file paths exist
+            if self.names_file_path and not os.path.exists(self.names_file_path):
+                self.names_file_path = ""
+            if self.template_pdf_path and not os.path.exists(self.template_pdf_path):
+                self.template_pdf_path = ""
+            if self.output_folder_path and not os.path.isdir(self.output_folder_path):
+                self.output_folder_path = ""
+            if self.font_path and not os.path.exists(self.font_path):
+                self.font_path = ""
+            
+            # Load signature attachments
+            signatures_data = session_data.get("signatures", [])
+            self.signatures = []
+            for sig_data in signatures_data:
+                path = sig_data.get("path", "")
+                if path and os.path.exists(path):
+                    try:
+                        # Load signature pixmap
+                        sig_pixmap = None
+                        if path.lower().endswith(".pdf"):
+                            doc = fitz.open(path)
+                            page = doc.load_page(0)
+                            pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0))
+                            img = Image.open(io.BytesIO(pix.tobytes("ppm")))
+                            buf = io.BytesIO()
+                            img.save(buf, format='PNG')
+                            buf.seek(0)
+                            sig_pixmap = QPixmap()
+                            sig_pixmap.loadFromData(buf.getvalue())
+                        else:
+                            sig_pixmap = QPixmap(path)
+                        
+                        if sig_pixmap and not sig_pixmap.isNull():
+                            sig_entry = {
+                                "path": path,
+                                "pixmap": sig_pixmap,
+                                "x_pts": sig_data.get("x_pts"),
+                                "y_pts": sig_data.get("y_pts"),
+                                "scale": sig_data.get("scale", 0.2),
+                            }
+                            self.signatures.append(sig_entry)
+                    except Exception:
+                        # Skip invalid signature files
+                        continue
+                
+        except Exception:
+            # Reset to defaults if session data is corrupted
+            pass
+
+    def _save_session_data(self):
+        """Save current session data."""
+        try:
+            # Prepare signature data for saving (only essential info, not pixmaps)
+            signatures_data = []
+            for sig in self.signatures:
+                sig_data = {
+                    "path": sig.get("path", ""),
+                    "x_pts": sig.get("x_pts"),
+                    "y_pts": sig.get("y_pts"),
+                    "scale": sig.get("scale", 0.2),
+                }
+                signatures_data.append(sig_data)
+            
+            session_data = {
+                "names_file_path": self.names_file_path,
+                "template_pdf_path": self.template_pdf_path,
+                "output_folder_path": self.output_folder_path,
+                "font_path": self.font_path,
+                "font_size": self.font_size,
+                "y_position": self.y_position,
+                "x_position": self.x_position,
+                "name_column": self.name_column,
+                "signatures": signatures_data,
+            }
+            save_session_data(session_data)
+        except Exception:
+            # Fail silently - session memory is optional
+            pass
+
+    def _restore_session_ui(self):
+        """Restore signature chips and trigger preview loading after UI is ready."""
+        try:
+            # Restore signature chips
+            for sig_entry in self.signatures:
+                self._create_signature_chip(sig_entry)
+            
+            # Trigger preview loading if we have both template and names
+            if self.template_pdf_path and self.names_file_path:
+                self._build_preview_names()
+                self.load_preview()
+                # Show zoom controls and position them
+                try:
+                    self.zoom_overlay.setVisible(True)
+                    QTimer.singleShot(0, self.position_zoom_overlay)
+                    QTimer.singleShot(0, self.position_nav_buttons)
+                except Exception:
+                    pass
+        except Exception:
+            # Fail silently if restoration fails
+            pass
+
+    def _create_signature_chip(self, sig_entry):
+        """Create a signature chip UI element for the given signature entry."""
+        try:
+            # Create chip UI - card-like row
+            chip = QWidget()
+            chip.setObjectName("sig_chip")
+            chip_lay = QHBoxLayout(chip)
+            chip_lay.setContentsMargins(10,8,10,8)
+            chip_lay.setSpacing(10)
+            
+            # left: thumbnail
+            thumb = QLabel()
+            thumb.setFixedSize(36, 28)
+            spix = sig_entry.get("pixmap")
+            if spix and not spix.isNull():
+                thumb.setPixmap(spix.scaled(36, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            thumb.setStyleSheet("border:1px solid #404040; border-radius:4px; background-color:#222;")
+            chip_lay.addWidget(thumb)
+            
+            # middle: filename and meta
+            name_col = QVBoxLayout()
+            name_lbl = QLabel(os.path.basename(sig_entry.get("path", "Unknown")))
+            name_lbl.setObjectName("sig_chip_label")
+            name_lbl.setStyleSheet("font-weight:600; color:#e8e8e8;")
+            meta_lbl = QLabel("Click to reposition · Drag in preview")
+            meta_lbl.setStyleSheet("color:#a0a0a0; font-size:10px;")
+            name_col.addWidget(name_lbl)
+            name_col.addWidget(meta_lbl)
+            chip_lay.addLayout(name_col, 1)
+            
+            # right: actions (remove)
+            rm = QPushButton("✕")
+            rm.setObjectName("sig_remove_btn")
+            rm.setFixedSize(22, 22)
+            chip_lay.addWidget(rm)
+            self.sig_list_layout.addWidget(chip)
+
+            def _remove():
+                try:
+                    idx = self.signatures.index(sig_entry)
+                    self.signatures.pop(idx)
+                except ValueError:
+                    pass
+                chip.setParent(None)
+                chip.deleteLater()
+                if self._base_pixmap is not None:
+                    self.refresh_preview_overlay()
+                # Save session data after removal
+                self._save_session_data()
+            rm.clicked.connect(_remove)
+
+            # Click chip to reconfigure placement
+            def _reconfigure():
+                if not self.template_pdf_path:
+                    return
+                try:
+                    # Open a lightweight placement dialog for the selected signature
+                    dlg = SignaturePositionDialog(self.template_pdf_path, self, sig_entry)
+                    if dlg.exec() == QDialog.Accepted:
+                        # sig_entry updated in the dialog
+                        if self._base_pixmap is not None:
+                            self.refresh_preview_overlay()
+                        # Save session data after reconfiguration
+                        self._save_session_data()
+                except Exception as e:
+                    QMessageBox.critical(self, "Signature", f"Error reconfiguring signature: {e}")
+            chip.mouseReleaseEvent = lambda ev: (_reconfigure() if ev.button() == Qt.LeftButton else None)
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Signature", f"Error creating signature chip: {e}")
+
     def browse_names(self):
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Excel or CSV File", "", 
@@ -1688,6 +1915,8 @@ class CertificateGeneratorApp(QMainWindow):
                 else:
                     self.refresh_preview_overlay()
             self.update_nav_buttons()
+            # Save session data
+            self._save_session_data()
         self._update_required_feedback()
 
     def browse_template(self):
@@ -1712,6 +1941,8 @@ class CertificateGeneratorApp(QMainWindow):
                 pass
             # Auto-open Y position selector
             self.reconfigure_position()
+            # Save session data
+            self._save_session_data()
         self._update_required_feedback()
 
     def browse_output(self):
@@ -1719,6 +1950,8 @@ class CertificateGeneratorApp(QMainWindow):
         if folder_path:
             self.output_edit.setText(folder_path)
             self.output_folder_path = folder_path
+            # Save session data
+            self._save_session_data()
         self._update_required_feedback()
 
     def browse_font(self):
@@ -1732,6 +1965,8 @@ class CertificateGeneratorApp(QMainWindow):
             # Refresh preview if template is already loaded
             if self.template_pdf_path:
                 self.load_preview()
+            # Save session data
+            self._save_session_data()
         self._update_required_feedback()
 
     def attach_signature(self):
@@ -1761,36 +1996,6 @@ class CertificateGeneratorApp(QMainWindow):
                 QMessageBox.warning(self, "Signature", "Could not load the selected signature.")
                 return
 
-            # Create chip UI - card-like row
-            chip = QWidget()
-            chip.setObjectName("sig_chip")
-            chip_lay = QHBoxLayout(chip)
-            chip_lay.setContentsMargins(10,8,10,8)
-            chip_lay.setSpacing(10)
-            # left: thumbnail
-            thumb = QLabel()
-            thumb.setFixedSize(36, 28)
-            if not sig_pixmap.isNull():
-                thumb.setPixmap(sig_pixmap.scaled(36, 28, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            thumb.setStyleSheet("border:1px solid #404040; border-radius:4px; background-color:#222;")
-            chip_lay.addWidget(thumb)
-            # middle: filename and meta
-            name_col = QVBoxLayout()
-            name_lbl = QLabel(os.path.basename(file_path))
-            name_lbl.setObjectName("sig_chip_label")
-            name_lbl.setStyleSheet("font-weight:600; color:#e8e8e8;")
-            meta_lbl = QLabel("Click to reposition · Drag in preview")
-            meta_lbl.setStyleSheet("color:#a0a0a0; font-size:10px;")
-            name_col.addWidget(name_lbl)
-            name_col.addWidget(meta_lbl)
-            chip_lay.addLayout(name_col, 1)
-            # right: actions (remove)
-            rm = QPushButton("✕")
-            rm.setObjectName("sig_remove_btn")
-            rm.setFixedSize(22, 22)
-            chip_lay.addWidget(rm)
-            self.sig_list_layout.addWidget(chip)
-
             # Initial placement near bottom-right quarter, scaled to 20% of page width
             sig_entry = {
                 "path": file_path,
@@ -1800,33 +2005,9 @@ class CertificateGeneratorApp(QMainWindow):
                 "scale": 0.2,
             }
             self.signatures.append(sig_entry)
-
-            def _remove():
-                try:
-                    idx = self.signatures.index(sig_entry)
-                    self.signatures.pop(idx)
-                except ValueError:
-                    pass
-                chip.setParent(None)
-                chip.deleteLater()
-                if self._base_pixmap is not None:
-                    self.refresh_preview_overlay()
-            rm.clicked.connect(_remove)
-
-            # Click chip to reconfigure placement
-            def _reconfigure():
-                if not self.template_pdf_path:
-                    return
-                try:
-                    # Open a lightweight placement dialog for the selected signature
-                    dlg = SignaturePositionDialog(self.template_pdf_path, self, sig_entry)
-                    if dlg.exec() == QDialog.Accepted:
-                        # sig_entry updated in the dialog
-                        if self._base_pixmap is not None:
-                            self.refresh_preview_overlay()
-                except Exception as e:
-                    QMessageBox.critical(self, "Signature", f"Error reconfiguring signature: {e}")
-            chip.mouseReleaseEvent = lambda ev: (_reconfigure() if ev.button() == Qt.LeftButton else None)
+            
+            # Create chip UI using the shared method
+            self._create_signature_chip(sig_entry)
 
             # Immediately open placement dialog
             try:
@@ -1834,6 +2015,8 @@ class CertificateGeneratorApp(QMainWindow):
                 if dlg.exec() == QDialog.Accepted:
                     if self._base_pixmap is not None:
                         self.refresh_preview_overlay()
+                    # Save session data after successful configuration
+                    self._save_session_data()
                 else:
                     # If user cancels first configuration, remove the chip and entry
                     try:
@@ -1841,8 +2024,13 @@ class CertificateGeneratorApp(QMainWindow):
                         self.signatures.pop(idx)
                     except ValueError:
                         pass
-                    chip.setParent(None)
-                    chip.deleteLater()
+                    # Find and remove the chip that was created
+                    for i in range(self.sig_list_layout.count()):
+                        widget = self.sig_list_layout.itemAt(i).widget()
+                        if widget and widget.objectName() == "sig_chip":
+                            widget.setParent(None)
+                            widget.deleteLater()
+                            break
                     if self._base_pixmap is not None:
                         self.refresh_preview_overlay()
             except Exception as e:
@@ -1868,6 +2056,8 @@ class CertificateGeneratorApp(QMainWindow):
                         self.refresh_preview_overlay()
                     else:
                         self.load_preview()
+                # Save session data
+                self._save_session_data()
         except ValueError:
             pass  # Ignore invalid input while typing
         self._update_required_feedback()
@@ -1893,6 +2083,8 @@ class CertificateGeneratorApp(QMainWindow):
                 self.refresh_preview_overlay()
             else:
                 self.load_preview()
+        # Save session data
+        self._save_session_data()
 
     def on_y_position_text_changed(self, text):
         """Live update Y position as user types"""
@@ -1906,6 +2098,8 @@ class CertificateGeneratorApp(QMainWindow):
                         self.refresh_preview_overlay()
                     else:
                         self.load_preview()
+                # Save session data
+                self._save_session_data()
         except ValueError:
             pass  # Ignore invalid input while typing
         self._update_required_feedback()
@@ -2311,6 +2505,8 @@ class CertificateGeneratorApp(QMainWindow):
                 self.refresh_preview_overlay()
             else:
                 self.load_preview()
+        # Save session data
+        self._save_session_data()
 
     def _build_preview_names(self):
         """Build the in-memory list of names from the selected column, stopping at first blank."""
@@ -2345,11 +2541,11 @@ class CertificateGeneratorApp(QMainWindow):
                 current_name = self.preview_names[self.preview_index]
                 current_name = capitalize_each_word_preserving_rest(current_name)
                 temp_font_id = QFontDatabase.addApplicationFont(self.font_path)
-                font_family = "Arial"
+                font_family = "Arial"  # Default fallback
                 if temp_font_id != -1:
                     families = QFontDatabase.applicationFontFamilies(temp_font_id)
                     if families:
-                        font_family = families[0]
+                        font_family = families[0]  # Use user-selected font for main preview
                 painter = QPainter(pixmap)
                 # Determine scale between PDF points and preview pixels
                 pdf_height_pts = float(self._pdf_page_height_pts or 1.0)
