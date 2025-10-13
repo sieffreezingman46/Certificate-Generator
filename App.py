@@ -6,13 +6,30 @@ import os
 import json
 from pathlib import Path
 import time
+import urllib.request
+import hashlib
+import threading
  
 
 # --- Ensure required packages are installed before importing them ---
 
+_PRINT_LOCK = threading.Lock()
+
+def safe_print(*args, **kwargs):
+    try:
+        with _PRINT_LOCK:
+            print(*args, **kwargs)
+            try:
+                sys.stdout.flush()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def print_start_banner():
     try:
-        print("""
+        safe_print("""
  ██████╗███████╗██████╗ ████████╗██╗███████╗██╗ ██████╗ █████╗ ████████╗███████╗
 ██╔════╝██╔════╝██╔══██╗╚══██╔══╝██║██╔════╝██║██╔════╝██╔══██╗╚══██╔══╝██╔════╝
 ██║     █████╗  ██████╔╝   ██║   ██║█████╗  ██║██║     ███████║   ██║   █████╗  
@@ -37,7 +54,7 @@ Smart PDF name placement with customizable UI
 
 def _print_exit_and_wait():
     try:
-        print("Exiting....")
+        safe_print("Exiting....")
         try:
             import sys as _sys
             _sys.stdout.flush()
@@ -89,28 +106,28 @@ def pre_start_update_check():
     Uses git to compare local and remote; does not modify files or restart.
     """
     try:
-        print("\n========== update: pre-flight ==========")
-        print("[update] initializing...")
+        safe_print("\n========== update: pre-flight ==========")
+        safe_print("[update] initializing...")
         repo_dir = Path(__file__).resolve().parent
         if not (repo_dir / ".git").exists():
-            print("[update] repo: not a git repository -> skip")
-            print("========== update: done =========\n")
+            safe_print("[update] repo: not a git repository -> skip")
+            safe_print("========== update: done =========\n")
             return
 
         def run_git(*args):
             return subprocess.run(["git", *args], cwd=str(repo_dir), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         # Fetch quietly
-        print("[update] fetching: remote refs ...")
+        safe_print("[update] fetching: remote refs ...")
         run_git("fetch", "--all", "--prune", "--quiet")
-        print("[update] fetching: ok")
+        safe_print("[update] fetching: ok")
 
         # Current branch
         res_branch = run_git("rev-parse", "--abbrev-ref", "HEAD")
         branch = (res_branch.stdout or "").strip()
         if res_branch.returncode != 0 or branch == "HEAD":
-            print("[update] branch: detached or unknown -> skip")
-            print("========== update: done =========\n")
+            safe_print("[update] branch: detached or unknown -> skip")
+            safe_print("========== update: done =========\n")
             return
 
         res_upstream = run_git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
@@ -118,29 +135,29 @@ def pre_start_update_check():
             upstream_ref = res_upstream.stdout.strip()
         else:
             upstream_ref = f"origin/{branch}"
-        print(f"[update] upstream: {upstream_ref}")
+        safe_print(f"[update] upstream: {upstream_ref}")
 
         res_local = run_git("rev-parse", "HEAD")
         res_remote = run_git("rev-parse", upstream_ref)
         if res_local.returncode != 0 or res_remote.returncode != 0:
-            print("[update] compare: failed -> skip")
-            print("========== update: done =========\n")
+            safe_print("[update] compare: failed -> skip")
+            safe_print("========== update: done =========\n")
             return
 
         local_sha = (res_local.stdout or "").strip()
         remote_sha = (res_remote.stdout or "").strip()
         if not local_sha or not remote_sha or local_sha == remote_sha:
-            print("[update] status: up-to-date ✓")
-            print("========== update: done =========\n")
+            safe_print("[update] status: up-to-date ✓")
+            safe_print("========== update: done =========\n")
             return
 
-        print(f"[update] status: behind  {local_sha[:7]} -> {remote_sha[:7]}")
-        print("[update] action: will apply after UI loads")
-        print("========== update: done =========\n")
+        safe_print(f"[update] status: behind  {local_sha[:7]} -> {remote_sha[:7]}")
+        safe_print("[update] action: will apply after UI loads")
+        safe_print("========== update: done =========\n")
     except Exception:
-        print("[update] error: pre-flight check skipped")
+        safe_print("[update] error: pre-flight check skipped")
         try:
-            print("========== update: done =========\n")
+            safe_print("========== update: done =========\n")
         except Exception:
             pass
 def _get_package_version(module):
@@ -148,21 +165,21 @@ def _get_package_version(module):
 
 def ensure_package(package_import_name, pip_name=None):
     package_to_install = pip_name or package_import_name
-    print(f"Checking {package_to_install} ...", end=" ")
+    safe_print(f"Checking {package_to_install} ...")
     try:
         module = importlib.import_module(package_import_name)
-        print(f"OK (v{_get_package_version(module)})")
+        safe_print(f"{package_to_install}: OK (v{_get_package_version(module)})")
         return
     except ImportError:
-        print("missing")
+        safe_print(f"{package_to_install}: missing")
 
-    print(f"Installing {package_to_install} ...")
+    safe_print(f"Installing {package_to_install} ...")
     try:
         subprocess.check_call([sys.executable, "-m", "pip", "install", package_to_install])
         module = importlib.import_module(package_import_name)
-        print(f"Installed {package_to_install} (v{_get_package_version(module)})")
+        safe_print(f"Installed {package_to_install} (v{_get_package_version(module)})")
     except Exception as e:
-        print(f"Failed to install {package_to_install}: {e}")
+        safe_print(f"Failed to install {package_to_install}: {e}")
         sys.exit(1)
 
 # Map import names to pip package names where they differ
@@ -177,11 +194,18 @@ REQUIRED_PACKAGES = [
 ]
 
 print_start_banner()
-pre_start_update_check()
-print("Checking required packages...")
-for import_name, pip_name in REQUIRED_PACKAGES:
-    ensure_package(import_name, pip_name)
-print("All required packages are present.\n")
+# Run update check before dependency checks (synchronous to keep output clean)
+try:
+    pre_start_update_check()
+except Exception:
+    pass
+if getattr(sys, "frozen", False):
+    safe_print("Running in packaged mode - skipping dependency checks.\n")
+else:
+    safe_print("Checking required packages...")
+    for import_name, pip_name in REQUIRED_PACKAGES:
+        ensure_package(import_name, pip_name)
+    safe_print("All required packages are present.\n")
 
 # Safe to import third-party libraries now
 import pandas as pd
@@ -205,69 +229,315 @@ from PySide6.QtGui import (
     QPixmap, QPainter, QPen, QFont, QIcon, QFontDatabase, QBrush, QColor,
     QPolygon
 )
+# Default raw URL for HTTP updater (can be overridden by APP_UPDATE_URL env)
+GITHUB_RAW_APP_URL = os.environ.get(
+    "APP_UPDATE_URL",
+    "https://raw.githubusercontent.com/sieffreezingman46/Certificate-Generator/main/App.py"
+).strip()
+
+# Default exe URL for frozen self-updater (can be overridden by APP_UPDATE_EXE_URL env)
+APP_UPDATE_EXE_URL = os.environ.get(
+    "APP_UPDATE_EXE_URL",
+    "https://github.com/sieffreezingman46/Certificate-Generator/releases/latest/download/CertificateGenerator.exe"
+).strip()
+
+
+def http_update_app_py_if_needed(parent_window=None) -> bool:
+    """HTTP fallback updater: downloads App.py from GITHUB_RAW_APP_URL and overwrites
+    local App.py if content differs. Returns True if an update was written.
+    Safe to call both when running from source and when frozen.
+    """
+    try:
+        # Never write App.py alongside a packaged exe
+        if getattr(sys, "frozen", False):
+            return False
+        if not GITHUB_RAW_APP_URL:
+            return False
+
+        # Determine install root depending on frozen state
+        if getattr(sys, "frozen", False):
+            install_root = Path(sys.executable).resolve().parent
+        else:
+            install_root = Path(__file__).resolve().parent
+
+        target_path = install_root / "App.py"
+        # Fetch remote content
+        with urllib.request.urlopen(GITHUB_RAW_APP_URL, timeout=10) as resp:
+            remote_bytes = resp.read()
+        if not remote_bytes:
+            return False
+
+        # If local file missing, write it
+        if not target_path.exists():
+            with open(target_path, "wb") as f:
+                f.write(remote_bytes)
+            return True
+
+        # Compare and update if different
+        try:
+            with open(target_path, "rb") as f:
+                local_bytes = f.read()
+        except Exception:
+            local_bytes = b""
+        if local_bytes == remote_bytes:
+            return False
+
+        # Overwrite
+        with open(target_path, "wb") as f:
+            f.write(remote_bytes)
+        return True
+    except Exception:
+        return False
+
+
+
+def _sha256_of_bytes(data: bytes) -> str:
+    try:
+        h = hashlib.sha256()
+        h.update(data or b"")
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def _sha256_of_file(path: Path) -> str:
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def frozen_self_update_exe_if_needed(parent_window=None) -> bool:
+    """When running as a packaged exe, download the latest exe and swap in-place.
+    Returns True if an update process was started (app should quit soon).
+    """
+    try:
+        if not getattr(sys, "frozen", False):
+            return False
+        if not APP_UPDATE_EXE_URL:
+            return False
+
+        # Current exe
+        current_exe = Path(sys.executable).resolve()
+
+        # Download target directory (user-local, not next to the exe)
+        local_root = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+        updates_dir = local_root / ".certificate_generator" / "updates"
+        updates_dir.mkdir(parents=True, exist_ok=True)
+        downloaded_exe = updates_dir / "CertificateGenerator.new.exe"
+
+        # Fetch remote exe bytes
+        with urllib.request.urlopen(APP_UPDATE_EXE_URL, timeout=20) as resp:
+            remote_bytes = resp.read()
+        if not remote_bytes:
+            return False
+
+        # Compare hashes to skip same version
+        remote_hash = _sha256_of_bytes(remote_bytes)
+        local_hash = _sha256_of_file(current_exe)
+        if remote_hash and local_hash and remote_hash == local_hash:
+            return False
+
+        # Write download to temp file
+        with open(downloaded_exe, "wb") as f:
+            f.write(remote_bytes)
+
+        # Spawn background PowerShell to wait, replace, and relaunch
+        pid = os.getpid()
+        old_path = str(current_exe).replace("'", "''")
+        new_path = str(downloaded_exe).replace("'", "''")
+        ps_script = (
+            f"$pidToWait={pid}; $old='{old_path}'; $new='{new_path}'; "
+            f"Wait-Process -Id $pidToWait; Start-Sleep -Milliseconds 200; "
+            f"Copy-Item -LiteralPath $new -Destination $old -Force; "
+            f"Remove-Item -LiteralPath $new -Force -ErrorAction SilentlyContinue; "
+            f"Start-Process -FilePath $old"
+        )
+        try:
+            subprocess.Popen([
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-WindowStyle", "Hidden", "-Command", ps_script
+            ])
+        except Exception:
+            # If PowerShell launch fails, leave the new file; user can replace manually
+            return False
+
+        # Optionally notify user (caller may show a message); signal that we should quit
+        return True
+    except Exception:
+        return False
+
+
+
+def _download_remote_exe_bytes(url: str, timeout: int = 20) -> bytes:
+    try:
+        if not url:
+            return b""
+        with urllib.request.urlopen(url, timeout=timeout) as resp:
+            return resp.read() or b""
+    except Exception:
+        return b""
+
+
+def _start_exe_swap_with_bytes(remote_bytes: bytes) -> bool:
+    """Write remote exe bytes to a temp path and spawn PowerShell to replace current .exe on exit."""
+    try:
+        if not getattr(sys, "frozen", False):
+            return False
+        if not remote_bytes:
+            return False
+        current_exe = Path(sys.executable).resolve()
+        local_root = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+        updates_dir = local_root / ".certificate_generator" / "updates"
+        updates_dir.mkdir(parents=True, exist_ok=True)
+        downloaded_exe = updates_dir / "CertificateGenerator.new.exe"
+        with open(downloaded_exe, "wb") as f:
+            f.write(remote_bytes)
+
+        pid = os.getpid()
+        old_path = str(current_exe).replace("'", "''")
+        new_path = str(downloaded_exe).replace("'", "''")
+        ps_script = (
+            f"$pidToWait={pid}; $old='{old_path}'; $new='{new_path}'; "
+            f"Wait-Process -Id $pidToWait; Start-Sleep -Milliseconds 200; "
+            f"Copy-Item -LiteralPath $new -Destination $old -Force; "
+            f"Remove-Item -LiteralPath $new -Force -ErrorAction SilentlyContinue; "
+            f"Start-Process -FilePath $old"
+        )
+        try:
+            subprocess.Popen([
+                "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                "-WindowStyle", "Hidden", "-Command", ps_script
+            ])
+        except Exception:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+class UpdateCheckWorker(QThread):
+    """Background worker to perform update checks without blocking UI."""
+    update_available = Signal()
+    updating_started = Signal()
+    restart_requested = Signal()
+
+    def __init__(self, parent_window=None, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent_window
+
+    def run(self):
+        try:
+            # Packaged: try frozen self-updater
+            if getattr(sys, "frozen", False):
+                try:
+                    # Probe remote bytes and compare hash to avoid unnecessary writes
+                    remote_bytes = _download_remote_exe_bytes(APP_UPDATE_EXE_URL)
+                    if remote_bytes:
+                        current_exe = Path(sys.executable).resolve()
+                        remote_hash = _sha256_of_bytes(remote_bytes)
+                        local_hash = _sha256_of_file(current_exe)
+                        if remote_hash and local_hash and remote_hash != local_hash:
+                            # Notify UI that update is available
+                            self.update_available.emit()
+                            # Show progress UI and begin swap
+                            self.updating_started.emit()
+                            started = _start_exe_swap_with_bytes(remote_bytes)
+                            if started:
+                                self.restart_requested.emit()
+                except Exception:
+                    pass
+                return
+
+            # Source tree: git or HTTP App.py fallback
+            repo_dir = Path(__file__).resolve().parent
+            if not (repo_dir / ".git").exists():
+                try:
+                    http_update_app_py_if_needed(self.parent_window)
+                except Exception:
+                    pass
+                return
+
+            def run_git(*args, raise_on_error=True):
+                result = subprocess.run([
+                    "git", *args
+                ], cwd=str(repo_dir), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                if raise_on_error and result.returncode != 0:
+                    raise RuntimeError(result.stderr.strip() or "git command failed")
+                return result
+
+            run_git("fetch", "--all", "--prune", "--quiet", raise_on_error=False)
+            res_branch = run_git("rev-parse", "--abbrev-ref", "HEAD", raise_on_error=False)
+            branch = (res_branch.stdout or "").strip()
+            if res_branch.returncode != 0 or branch == "HEAD":
+                return
+
+            res_upstream = run_git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", raise_on_error=False)
+            if res_upstream.returncode == 0:
+                upstream_ref = res_upstream.stdout.strip()
+            else:
+                upstream_ref = f"origin/{branch}"
+
+            res_local = run_git("rev-parse", "HEAD", raise_on_error=False)
+            res_remote = run_git("rev-parse", upstream_ref, raise_on_error=False)
+            if res_local.returncode != 0 or res_remote.returncode != 0:
+                return
+
+            local_sha = (res_local.stdout or "").strip()
+            remote_sha = (res_remote.stdout or "").strip()
+            if not local_sha or not remote_sha or local_sha == remote_sha:
+                return
+
+            pull = run_git("pull", "--rebase", "--autostash", raise_on_error=False)
+            if pull.returncode != 0:
+                return
+
+            # Restart to apply source updates
+            self.restart_requested.emit()
+        except Exception:
+            # Never block or crash on updater
+            pass
 
 
 def check_for_updates_on_startup(parent_window=None):
-    """Fetch and apply updates from the git remote if the local repo is behind.
-    Runs silently; if an update happens, the app will restart.
-    """
+    """Kick off a background update check without blocking UI."""
     try:
-        repo_dir = Path(__file__).resolve().parent
-        if not (repo_dir / ".git").exists():
-            return  # Not a git repo; skip
+        app = QApplication.instance()
+        worker = UpdateCheckWorker(parent_window=parent_window, parent=app)
+        # Popup notifying the user an update is available
+        def _notify_available():
+            try:
+                if parent_window is not None:
+                    QMessageBox.information(parent_window, "New Update Is Available!", "New Update Is Available!")
+            except Exception:
+                pass
 
-        def run_git(*args, raise_on_error=True):
-            result = subprocess.run([
-                "git", *args
-            ], cwd=str(repo_dir), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            if raise_on_error and result.returncode != 0:
-                raise RuntimeError(result.stderr.strip() or "git command failed")
-            return result
+        # Show a standard Windows-style indeterminate progress dialog while updating
+        def _show_updating():
+            try:
+                if parent_window is not None:
+                    from PySide6.QtWidgets import QProgressDialog
+                    dlg = QProgressDialog("Updating App...", None, 0, 0, parent_window)
+                    dlg.setWindowTitle("Updating App")
+                    dlg.setCancelButton(None)
+                    dlg.setAutoClose(False)
+                    dlg.setAutoReset(False)
+                    dlg.setWindowModality(Qt.ApplicationModal)
+                    dlg.setMinimumDuration(0)
+                    dlg.show()
+                    setattr(parent_window, "_update_progress_dialog", dlg)
+            except Exception:
+                pass
 
-        # Fetch remote refs quietly
-        run_git("fetch", "--all", "--prune", "--quiet", raise_on_error=False)
-
-        # Determine current branch and upstream
-        res_branch = run_git("rev-parse", "--abbrev-ref", "HEAD", raise_on_error=False)
-        branch = (res_branch.stdout or "").strip()
-        if res_branch.returncode != 0 or branch == "HEAD":
-            return  # Detached or unknown; skip
-
-        res_upstream = run_git("rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}", raise_on_error=False)
-        if res_upstream.returncode == 0:
-            upstream_ref = res_upstream.stdout.strip()
-        else:
-            upstream_ref = f"origin/{branch}"
-            
-        # Compare local and upstream commits
-        res_local = run_git("rev-parse", "HEAD", raise_on_error=False)
-        res_remote = run_git("rev-parse", upstream_ref, raise_on_error=False)
-        if res_local.returncode != 0 or res_remote.returncode != 0:
-            return
-
-        local_sha = res_local.stdout.strip()
-        remote_sha = res_remote.stdout.strip()
-        if not local_sha or not remote_sha or local_sha == remote_sha:
-            return  # Up to date
-
-        # Attempt to pull updates with autostash
-        pull = run_git("pull", "--rebase", "--autostash", raise_on_error=False)
-        if pull.returncode != 0:
-            return  # Do not disrupt the user if pull fails
-
-        # Restart application to load updated code
-        try:
-            if parent_window is not None:
-                QMessageBox.information(parent_window, "Updating", "An update was applied. Restarting...")
-        except Exception:
-            pass
-
-        script_path = Path(__file__).resolve()
-        python = sys.executable
-        subprocess.Popen([python, str(script_path)] + sys.argv[1:])
-        QTimer.singleShot(50, lambda: QApplication.instance().quit())
+        worker.update_available.connect(_notify_available)
+        worker.updating_started.connect(_show_updating)
+        worker.restart_requested.connect(lambda: QTimer.singleShot(50, lambda: QApplication.instance().quit()))
+        worker.start()
     except Exception:
-        # Fail silently; never block app start due to updater
         pass
 
 def capitalize_each_word_preserving_rest(name):
@@ -2323,6 +2593,42 @@ class CertificateGeneratorApp(QMainWindow):
             rm = QPushButton("✕")
             rm.setObjectName("sig_remove_btn")
             rm.setFixedSize(22, 22)
+            # Ensure visibility and contrast; keep background fully neutral and icon-based X
+            rm.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            rm.setCursor(Qt.PointingHandCursor)
+            rm.setStyleSheet(
+                "QPushButton#sig_remove_btn {"
+                "  background: none;"
+                "  background-color: transparent;"
+                "  border: 1px solid #FF4D4D;"
+                "  border-radius: 11px;"
+                "  padding: 0px;"
+                "  min-width: 22px; min-height: 22px;"
+                "}"
+                "QPushButton#sig_remove_btn:hover {"
+                "  background: none;"
+                "  background-color: rgba(255,77,77,0.12);"
+                "}"
+            )
+            # Draw a crisp red X icon so it never looks like a filled square
+            try:
+                icon_size = 12
+                pm = QPixmap(icon_size, icon_size)
+                pm.fill(Qt.transparent)
+                p = QPainter(pm)
+                p.setRenderHint(QPainter.Antialiasing)
+                pen = QPen(QColor('#FF4D4D'))
+                pen.setWidth(2)
+                p.setPen(pen)
+                p.drawLine(2, 2, icon_size - 3, icon_size - 3)
+                p.drawLine(icon_size - 3, 2, 2, icon_size - 3)
+                p.end()
+                rm.setIcon(QIcon(pm))
+                rm.setIconSize(QSize(icon_size, icon_size))
+                rm.setText("")
+            except Exception:
+                # Fallback to text if icon drawing fails
+                rm.setText("✕")
             chip_lay.addWidget(rm)
             self.sig_list_layout.addWidget(chip)
 
@@ -3132,13 +3438,13 @@ def main():
     
     # Set application properties
     app.setApplicationName("Certificate Generator")
-    app.setApplicationVersion("2.0")
+    app.setApplicationVersion("3.0")
     app.setOrganizationName("Certificate Tools")
     
     window = CertificateGeneratorApp()
     window.show()
     
-    # Check for updates shortly after the UI shows, so prompts have a parent
+    # Run only the interactive updater shortly after UI shows
     try:
         QTimer.singleShot(200, lambda: check_for_updates_on_startup(window))
     except Exception:
