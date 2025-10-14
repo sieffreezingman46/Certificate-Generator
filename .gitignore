@@ -4,8 +4,8 @@
 # Allow traversing directories so we can unignore specific files within
 !*/
 
-# Keep this file
-!.gitignore
+# Ignore this file
+.gitignore
 
 # Keep main application script at repo root
 !App.py
@@ -22,10 +22,8 @@
 # Ignore build artifacts
 build/
 dist/
-*.spec
-
-# Allow only specific exe files at repo root
 !CertificateGenerator.exe
-!CertificateGeneraor.exe
+
+*.spec
 
 
