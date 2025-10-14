@@ -1,0 +1,31 @@
+# Ignore everything by default
+*
+
+# Allow traversing directories so we can unignore specific files within
+!*/
+
+# Keep this file
+!.gitignore
+
+# Keep main application script at repo root
+!App.py
+
+# Explicitly ignore local virtual environment
+.venv/
+
+# Keep font files anywhere
+!*.ttf
+!*.otf
+!*.TTF
+!*.OTF
+
+# Ignore build artifacts
+build/
+dist/
+*.spec
+
+# Allow only specific exe files at repo root
+!CertificateGenerator.exe
+!CertificateGeneraor.exe
+
+
