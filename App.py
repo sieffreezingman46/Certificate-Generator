@@ -27,9 +27,12 @@ def safe_print(*args, **kwargs):
         pass
 
 
+# Application version for comparison with GitHub Releases (semantic version without leading 'v')
+APP_VERSION = "3.0.0"
+
 def print_start_banner():
     try:
-        safe_print("""
+        safe_print(f"""
  ██████╗███████╗██████╗ ████████╗██╗███████╗██╗ ██████╗ █████╗ ████████╗███████╗
 ██╔════╝██╔════╝██╔══██╗╚══██╔══╝██║██╔════╝██║██╔════╝██╔══██╗╚══██╔══╝██╔════╝
 ██║     █████╗  ██████╔╝   ██║   ██║█████╗  ██║██║     ███████║   ██║   █████╗  
@@ -44,7 +47,7 @@ def print_start_banner():
 ╚██████╔╝███████╗██║ ╚████║███████╗██║  ██║██║  ██║   ██║   ╚██████╔╝██║  ██║   
  ╚═════╝ ╚══════╝╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝    ╚═════╝ ╚═╝  ╚═╝   
 
-Automated Certificate Generator v3.0
+Automated Certificate Generator v{APP_VERSION}
 Smart PDF name placement with customizable UI
 
 """)
@@ -242,6 +245,63 @@ APP_UPDATE_EXE_URL = os.environ.get(
 ).strip()
 
 
+# GitHub Releases API for version discovery
+GITHUB_RELEASES_API = os.environ.get(
+    "APP_RELEASES_API",
+    "https://api.github.com/repos/sieffreezingman46/Certificate-Generator/releases/latest"
+).strip()
+
+
+def _parse_version_tag(tag: str) -> str:
+    try:
+        if not tag:
+            return ""
+        t = tag.strip()
+        if t.lower().startswith("v"):
+            t = t[1:]
+        return t
+    except Exception:
+        return ""
+
+
+def _compare_versions(a: str, b: str) -> int:
+    """Return -1 if a<b, 0 if a==b, 1 if a>b using simple semver compare."""
+    try:
+        def parts(v):
+            return [int(x) for x in (v or "0").split(".")]
+        pa = parts(a)
+        pb = parts(b)
+        # normalize lengths
+        L = max(len(pa), len(pb))
+        pa += [0] * (L - len(pa))
+        pb += [0] * (L - len(pb))
+        for i in range(L):
+            if pa[i] < pb[i]:
+                return -1
+            if pa[i] > pb[i]:
+                return 1
+        return 0
+    except Exception:
+        return 0
+
+
+class UpdateDownloadWorker(QThread):
+    """Background downloader that fetches latest EXE and stages swap, then signals restart."""
+    ready_to_restart = Signal()
+
+    def run(self):
+        try:
+            # Download latest exe bytes
+            remote_bytes = _download_remote_exe_bytes(APP_UPDATE_EXE_URL)
+            if not remote_bytes:
+                return
+            started = _start_exe_swap_with_bytes(remote_bytes)
+            if started:
+                self.ready_to_restart.emit()
+        except Exception:
+            pass
+
+
 def http_update_app_py_if_needed(parent_window=None) -> bool:
     """HTTP fallback updater: downloads App.py from GITHUB_RAW_APP_URL and overwrites
     local App.py if content differs. Returns True if an update was written.
@@ -423,6 +483,7 @@ def _start_exe_swap_with_bytes(remote_bytes: bytes) -> bool:
 class UpdateCheckWorker(QThread):
     """Background worker to perform update checks without blocking UI."""
     update_available = Signal()
+    no_update = Signal()
     updating_started = Signal()
     restart_requested = Signal()
 
@@ -432,23 +493,32 @@ class UpdateCheckWorker(QThread):
 
     def run(self):
         try:
-            # Packaged: try frozen self-updater
+            # Packaged: check latest release tag and prompt user before downloading
             if getattr(sys, "frozen", False):
                 try:
-                    # Probe remote bytes and compare hash to avoid unnecessary writes
-                    remote_bytes = _download_remote_exe_bytes(APP_UPDATE_EXE_URL)
-                    if remote_bytes:
-                        current_exe = Path(sys.executable).resolve()
-                        remote_hash = _sha256_of_bytes(remote_bytes)
-                        local_hash = _sha256_of_file(current_exe)
-                        if remote_hash and local_hash and remote_hash != local_hash:
-                            # Notify UI that update is available
-                            self.update_available.emit()
-                            # Show progress UI and begin swap
-                            self.updating_started.emit()
-                            started = _start_exe_swap_with_bytes(remote_bytes)
-                            if started:
-                                self.restart_requested.emit()
+                    # Use GitHub Releases API to compare semantic versions when available
+                    latest_tag = ""
+                    try:
+                        with urllib.request.urlopen(GITHUB_RELEASES_API, timeout=10) as resp:
+                            data = json.loads(resp.read().decode('utf-8', errors='ignore') or '{}')
+                            latest_tag = _parse_version_tag(data.get('tag_name') or '')
+                    except Exception:
+                        latest_tag = ""
+
+                    local_ver = APP_VERSION
+                    if latest_tag and _compare_versions(local_ver, latest_tag) < 0:
+                        self.update_available.emit()
+                    else:
+                        # Fallback to hash compare if API did not yield newer
+                        remote_bytes = _download_remote_exe_bytes(APP_UPDATE_EXE_URL)
+                        if remote_bytes:
+                            current_exe = Path(sys.executable).resolve()
+                            remote_hash = _sha256_of_bytes(remote_bytes)
+                            local_hash = _sha256_of_file(current_exe)
+                            if remote_hash and local_hash and remote_hash != local_hash:
+                                self.update_available.emit()
+                            else:
+                                self.no_update.emit()
                 except Exception:
                     pass
                 return
@@ -504,38 +574,65 @@ class UpdateCheckWorker(QThread):
 
 
 def check_for_updates_on_startup(parent_window=None):
-    """Kick off a background update check without blocking UI."""
+    """Kick off a background update check without blocking UI.
+    If called by a manual action, pass show_no_update=True to inform the user when up-to-date.
+    """
     try:
         app = QApplication.instance()
         worker = UpdateCheckWorker(parent_window=parent_window, parent=app)
-        # Popup notifying the user an update is available
+        # Prompt user and optionally start download-and-swap
         def _notify_available():
             try:
                 if parent_window is not None:
-                    QMessageBox.information(parent_window, "New Update Is Available!", "New Update Is Available!")
+                    # Custom button labels: Install / Later
+                    install_btn = QMessageBox.Yes
+                    later_btn = QMessageBox.No
+                    reply = QMessageBox.question(
+                        parent_window,
+                        "Update Available",
+                        "A new version is available. Install now or later?",
+                        install_btn | later_btn,
+                        install_btn
+                    )
+                    if reply == install_btn:
+                        # Show progress dialog
+                        from PySide6.QtWidgets import QProgressDialog
+                        dlg = QProgressDialog("Updating App...", None, 0, 0, parent_window)
+                        dlg.setWindowTitle("Updating App")
+                        dlg.setCancelButton(None)
+                        dlg.setAutoClose(False)
+                        dlg.setAutoReset(False)
+                        dlg.setWindowModality(Qt.ApplicationModal)
+                        dlg.setMinimumDuration(0)
+                        dlg.show()
+                        setattr(parent_window, "_update_progress_dialog", dlg)
+
+                        # Start background download and swap
+                        downloader = UpdateDownloadWorker(parent=app)
+                        def _on_ready():
+                            try:
+                                # Close dialog if present
+                                d = getattr(parent_window, "_update_progress_dialog", None)
+                                if d is not None:
+                                    d.close()
+                            except Exception:
+                                pass
+                            QTimer.singleShot(50, lambda: QApplication.instance().quit())
+                        downloader.ready_to_restart.connect(_on_ready)
+                        downloader.start()
             except Exception:
                 pass
 
-        # Show a standard Windows-style indeterminate progress dialog while updating
-        def _show_updating():
+        # Optional notification when already up-to-date (used by manual check)
+        def _notify_no_update():
             try:
-                if parent_window is not None:
-                    from PySide6.QtWidgets import QProgressDialog
-                    dlg = QProgressDialog("Updating App...", None, 0, 0, parent_window)
-                    dlg.setWindowTitle("Updating App")
-                    dlg.setCancelButton(None)
-                    dlg.setAutoClose(False)
-                    dlg.setAutoReset(False)
-                    dlg.setWindowModality(Qt.ApplicationModal)
-                    dlg.setMinimumDuration(0)
-                    dlg.show()
-                    setattr(parent_window, "_update_progress_dialog", dlg)
+                if parent_window is not None and getattr(parent_window, "_manual_update_invocation", False):
+                    QMessageBox.information(parent_window, "You're up to date", "You already have the latest version.")
             except Exception:
                 pass
 
         worker.update_available.connect(_notify_available)
-        worker.updating_started.connect(_show_updating)
-        worker.restart_requested.connect(lambda: QTimer.singleShot(50, lambda: QApplication.instance().quit()))
+        worker.no_update.connect(_notify_no_update)
         worker.start()
     except Exception:
         pass
@@ -2053,6 +2150,8 @@ class CertificateGeneratorApp(QMainWindow):
         self.generate_btn.clicked.connect(self.generate_certificates)
         actions_layout.addWidget(self.generate_btn)
         
+        
+
         # Open output folder button
         self.open_folder_btn = QPushButton("Open Output Folder")
         self.open_folder_btn.clicked.connect(self.open_output_folder)
@@ -3438,7 +3537,10 @@ def main():
     
     # Set application properties
     app.setApplicationName("Certificate Generator")
-    app.setApplicationVersion("3.0")
+    try:
+        app.setApplicationVersion(APP_VERSION)
+    except Exception:
+        app.setApplicationVersion("3.0")
     app.setOrganizationName("Certificate Tools")
     
     window = CertificateGeneratorApp()
