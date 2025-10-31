@@ -28,7 +28,7 @@ def safe_print(*args, **kwargs):
 
 
 # Application version for comparison with GitHub Releases (semantic version without leading 'v')
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 
 def print_start_banner():
     try:
@@ -225,7 +225,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QGridLayout, QLabel, QLineEdit, QPushButton, QProgressBar, 
     QFileDialog, QMessageBox, QGroupBox, QSpinBox, QFrame,
-    QDialog, QSizePolicy, QScrollArea, QSplitter, QSlider
+    QDialog, QSizePolicy, QScrollArea, QSplitter, QSlider, QColorDialog
 )
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QSize, QRect, QPoint
 from PySide6.QtGui import (
@@ -882,7 +882,7 @@ class CertificateGeneratorThread(QThread):
     error_occurred = Signal(str)
 
     def __init__(self, names_file_path, template_pdf_path, output_folder_path, 
-                 font_path, font_size, x_position, y_position, name_column):
+                 font_path, font_size, x_position, y_position, name_column, text_color_rgb=None):
         super().__init__()
         self.names_file_path = names_file_path
         self.template_pdf_path = template_pdf_path
@@ -892,6 +892,16 @@ class CertificateGeneratorThread(QThread):
         self.x_position = x_position
         self.y_position = y_position
         self.name_column = name_column
+        # Text color as floats (0..1); default black
+        try:
+            if text_color_rgb and len(text_color_rgb) == 3:
+                self.text_color_rgb = (
+                    float(text_color_rgb[0]), float(text_color_rgb[1]), float(text_color_rgb[2])
+                )
+            else:
+                self.text_color_rgb = (0.0, 0.0, 0.0)
+        except Exception:
+            self.text_color_rgb = (0.0, 0.0, 0.0)
 
     def run(self):
         try:
@@ -944,6 +954,12 @@ class CertificateGeneratorThread(QThread):
                 packet = io.BytesIO()
                 can = canvas.Canvas(packet, pagesize=(page_width, page_height))
                 try:
+                    # Apply text color
+                    try:
+                        r, g, b = self.text_color_rgb
+                        can.setFillColorRGB(float(r), float(g), float(b))
+                    except Exception:
+                        pass
                     can.setFont(font_name, int(self.font_size))
                     # Use selected X (center) if provided, otherwise default to page center
                     x_center = float(self.x_position) if self.x_position is not None else (page_width / 2.0)
@@ -1955,6 +1971,12 @@ class CertificateGeneratorApp(QMainWindow):
         self._pan_start = None
         self._fit_on_next_load = False
         self._show_required_feedback = False
+        # Text color state (default black)
+        try:
+            self.text_color = QColor("#000000")
+        except Exception:
+            self.text_color = QColor(0, 0, 0)
+        self._last_valid_text_color_hex = "#000000"
         # Multi-preview state
         self.preview_names = []
         self.preview_index = 0
@@ -2073,6 +2095,25 @@ class CertificateGeneratorApp(QMainWindow):
         self.font_size_edit.setPlaceholderText("e.g. 30")
         self.font_size_edit.textChanged.connect(self.on_font_size_text_changed)
         options_layout.addWidget(self.font_size_edit, 0, 1)
+
+        # Text Color control: clickable preview square (opens color dialog)
+        color_row = QHBoxLayout()
+        self.color_preview = QLabel()
+        self.color_preview.setFixedSize(22, 22)
+        self.color_preview.setStyleSheet("border: 1px solid #404040; border-radius: 4px;")
+        try:
+            self.color_preview.setCursor(Qt.PointingHandCursor)
+            self.color_preview.setToolTip("Click to choose text color")
+        except Exception:
+            pass
+        # Click to open color dialog
+        try:
+            self.color_preview.mousePressEvent = self.on_color_preview_clicked
+        except Exception:
+            pass
+        color_row.addWidget(self.color_preview)
+        color_row.addStretch(1)
+        options_layout.addLayout(color_row, 0, 2)
         
         # X position
         options_layout.addWidget(QLabel("X position:"), 1, 0)
@@ -2538,7 +2579,11 @@ class CertificateGeneratorApp(QMainWindow):
 
     def setup_defaults(self):
         # No default font; user should choose a font file
-        pass
+        try:
+            # Initialize color UI to current text_color
+            self._apply_text_color_to_ui()
+        except Exception:
+            pass
 
     def _load_session_data(self):
         """Load session data and apply to instance variables."""
@@ -2602,6 +2647,16 @@ class CertificateGeneratorApp(QMainWindow):
                         # Skip invalid signature files
                         continue
                 
+            # Load text color if present
+            try:
+                hex_color = session_data.get("text_color")
+                if isinstance(hex_color, str) and hex_color.strip():
+                    qc = QColor(hex_color.strip())
+                    if qc.isValid():
+                        self.text_color = qc
+                        self._last_valid_text_color_hex = self._qcolor_to_hex(qc)
+            except Exception:
+                pass
         except Exception:
             # Reset to defaults if session data is corrupted
             pass
@@ -2630,6 +2685,7 @@ class CertificateGeneratorApp(QMainWindow):
                 "x_position": self.x_position,
                 "name_column": self.name_column,
                 "signatures": signatures_data,
+                "text_color": self._text_color_hex(),
             }
             save_session_data(session_data)
         except Exception:
@@ -2930,6 +2986,118 @@ class CertificateGeneratorApp(QMainWindow):
             pass  # Ignore invalid input while typing
         self._update_required_feedback()
 
+    def _text_color_hex(self) -> str:
+        try:
+            return (self.text_color.name().upper() if hasattr(self, 'text_color') else "#000000")
+        except Exception:
+            return "#000000"
+
+    def _apply_text_color_to_ui(self):
+        try:
+            hexv = self._text_color_hex()
+            if hasattr(self, 'color_hex_edit'):
+                self.color_hex_edit.setText(hexv)
+            if hasattr(self, 'color_preview'):
+                self.color_preview.setStyleSheet(
+                    f"border: 1px solid #404040; border-radius: 4px; background-color: {hexv};")
+            # Refresh preview overlay color
+            if self._base_pixmap is not None:
+                self.refresh_preview_overlay()
+        except Exception:
+            pass
+
+    def on_pick_color(self):
+        try:
+            initial = self.text_color if hasattr(self, 'text_color') else QColor("#000000")
+            original_hex = self._qcolor_to_hex(initial)
+            dlg = QColorDialog(initial, self)
+            try:
+                dlg.setWindowTitle("Select Text Color")
+            except Exception:
+                pass
+
+            def _on_current_color_changed(c):
+                try:
+                    if c.isValid():
+                        self.text_color = c
+                        # Live update preview and UI
+                        self._apply_text_color_to_ui()
+                except Exception:
+                    pass
+
+            def _on_selected(c):
+                try:
+                    if c.isValid():
+                        self.text_color = c
+                        self._last_valid_text_color_hex = self._qcolor_to_hex(c)
+                        self._apply_text_color_to_ui()
+                        self._save_session_data()
+                except Exception:
+                    pass
+
+            def _on_rejected():
+                try:
+                    qc = QColor(original_hex)
+                    if qc.isValid():
+                        self.text_color = qc
+                    self._apply_text_color_to_ui()
+                except Exception:
+                    pass
+
+            try:
+                dlg.currentColorChanged.connect(_on_current_color_changed)
+                dlg.colorSelected.connect(_on_selected)
+                dlg.rejected.connect(_on_rejected)
+            except Exception:
+                pass
+
+            try:
+                dlg.exec()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    def _qcolor_to_hex(self, qc: QColor) -> str:
+        try:
+            return qc.name().upper()
+        except Exception:
+            return "#000000"
+
+    def on_color_hex_edited(self):
+        try:
+            txt = (self.color_hex_edit.text() or "").strip().upper()
+            if not txt:
+                # Revert if empty
+                self.color_hex_edit.setText(self._last_valid_text_color_hex)
+                return
+            if not txt.startswith('#'):
+                txt = '#' + txt
+            # Validate #RRGGBB
+            ok = (len(txt) == 7 and all(c in '0123456789ABCDEF' for c in txt[1:]))
+            if ok:
+                qc = QColor(txt)
+                if qc.isValid():
+                    self.text_color = qc
+                    self._last_valid_text_color_hex = txt
+                    self._apply_text_color_to_ui()
+                    self._save_session_data()
+                    return
+            # Invalid -> revert
+            self.color_hex_edit.setText(self._last_valid_text_color_hex)
+        except Exception:
+            try:
+                self.color_hex_edit.setText(self._last_valid_text_color_hex)
+            except Exception:
+                pass
+
+    def on_color_preview_clicked(self, event):
+        try:
+            # Delegate to existing color dialog logic
+            self.on_pick_color()
+        except Exception:
+            pass
+
     def on_y_position_changed(self, value):
         self.y_position = value
         # Refresh preview if template is already loaded
@@ -3063,9 +3231,15 @@ class CertificateGeneratorApp(QMainWindow):
         self.status_label.setText("Starting generation...")
         
         # Start generation thread
+        try:
+            r, g, b, _ = self.text_color.getRgb()
+            tc_rgb = (float(r) / 255.0, float(g) / 255.0, float(b) / 255.0)
+        except Exception:
+            tc_rgb = (0.0, 0.0, 0.0)
         self.generator_thread = CertificateGeneratorThread(
             self.names_file_path, self.template_pdf_path, self.output_folder_path,
-            self.font_path, self.font_size, self.x_position, self.y_position, self.name_column
+            self.font_path, self.font_size, self.x_position, self.y_position, self.name_column,
+            text_color_rgb=tc_rgb
         )
         # Pass signatures (path/x/y/scale only) to the worker thread
         try:
@@ -3452,7 +3626,10 @@ class CertificateGeneratorApp(QMainWindow):
                 font = QFont(font_family)
                 font.setPixelSize(preview_font_px)
                 painter.setFont(font)
-                painter.setPen(QPen(Qt.black, 2))
+                try:
+                    painter.setPen(QPen(self.text_color if hasattr(self, 'text_color') else Qt.black, 2))
+                except Exception:
+                    painter.setPen(QPen(Qt.black, 2))
                 # X position: center if None, else map from PDF points to pixels
                 if self.x_position is None:
                     center_x = pixmap.width() // 2
